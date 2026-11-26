@@ -19,7 +19,7 @@
 | `footnotes[]` | `id`、`page`、`bbox`、`text` |
 | `references[]` | `id`、`label`（[n] 或序号）、`text`、`page`、`pages`、`block`、`bbox`、`year`、`doi`、`arxiv`、`split_rule` |
 | `furniture[]` | 从正文流剔除的页面杂项：`page`、`role`（running_header/running_footer/page_number/margin_text/line_number）、`text`、`bbox` |
-| `changes` | `dehyphenation[]`（`from` “pre-|training”，`to`，`rule`）、`ligatures_expanded`、`invisible_chars_removed`、`merged_paragraphs[]`、`lines_split_at_column_gutter`、`ocr_numeric_corrections[]`、`furniture_removed` |
+| `changes` | `dehyphenation[]`（`from` “pre-|training”，`to`，`rule`）、`ligatures_expanded`、`invisible_chars_removed`、`merged_paragraphs[]`、`lines_split_at_column_gutter`、`ocr_numeric_corrections[]`（OCR 数字校正与中文语境半角→全角标点还原，`[原词, 改后]`）、`furniture_removed` |
 | `ocr` | `engine`、`lang`、`pages[]{page,lang,mean_conf,words,low_conf_words[[词,置信度,bbox]],preprocess}`、`skipped_pages`、`notes` |
 | `qa` | `status`（success/success_with_warnings/partial）、`checks[]{check,value,ok,…}`、`token_recall_vs_<提取器>`、`failed_checks` |
 | `warnings[]`、`previews[]` | 警告；页面预览图的相对路径 |
@@ -36,6 +36,6 @@
 | `uncertainties[]` | 解析警告、未通过的 QA 检查、OCR 低置信词、未核实的引文，以及 Agent 补充的不确定项 |
 | `not_reported[]` | 原文未报告或无法读取的项目（如图片表格、缺失文件、远程链接），附人工接管建议 |
 | `manual_takeover[]` | 需要人工处理的页或文件及原因 |
-| `change_records[]` | 相对原始文字层所做的全部改动（剔除的页面杂项、去连字符、段落接续、连字展开、OCR 数字校正），原始逐行文字保留在 `document.json` 中 |
+| `change_records[]` | 相对原始文字层所做的全部改动（剔除的页面杂项、去连字符、段落接续、连字展开、OCR 数字与标点校正），原始逐行文字保留在 `document.json` 中 |
 | `contract` | 契约原文；`auto_filled`、`agent_filled`、`unfilled` 三类字段清单 |
 | `run` | 是否为草稿、完成时间、case.json 路径 |

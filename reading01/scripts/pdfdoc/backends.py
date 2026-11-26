@@ -514,6 +514,7 @@ def extract_pdfplumber(path, pages, stats):
 # --------------------------------------------------------------------------
 
 _HEIGHT_TO_SIZE = 1.0  # poppler word box height ~= nominal font size (calibrated on pdfTeX output)
+_OCR_INK_TO_EM = 0.9  # tesseract line ink height (ascender..descender) as a share of the font size
 
 
 def extract_poppler(path, pages, stats):
@@ -699,6 +700,33 @@ def _ocr_fix_token(t):
     return t.translate(str.maketrans({"O": "0", "o": "0", "I": "1", "l": "1", "|": "1"}))
 
 
+_CJK_CHAR = re.compile(r"[　-〿㐀-䶿一-鿿豈-﫿＀-￯]")
+_HALF_TO_FULL = {",": "，", ":": "：", ";": "；", "(": "（", ")": "）", "?": "？", "!": "！"}
+
+
+def _ocr_cjk_punct(ws, stats):
+    """Tesseract's chi_sim model emits ASCII punctuation (",", ":", "(") inside Chinese text.
+    Restore the full-width form when the punctuation touches a CJK character in the same line."""
+    flat = "".join(w["t"] for w in ws)
+    new = list(flat)
+    for k, ch in enumerate(flat):
+        if ch not in _HALF_TO_FULL:
+            continue
+        prev = flat[k - 1] if k > 0 else ""
+        nxt = flat[k + 1] if k + 1 < len(flat) else ""
+        if _CJK_CHAR.match(prev) or _CJK_CHAR.match(nxt):
+            new[k] = _HALF_TO_FULL[ch]
+    if new == list(flat):
+        return
+    n = 0
+    for i, w in enumerate(ws):
+        t = "".join(new[n:n + len(w["t"])])
+        if t != w["t"]:
+            stats.setdefault("ocr_corrections", []).append([w["t"], t])
+            w["t"] = t
+        n += len(w["t"])
+
+
 def ocr_image_to_lines(img_path, scale, lang, stats):
     """Run tesseract on an image; return (lines, mean_conf, n_words, low_conf_words)."""
     tsv = _tesseract_tsv(img_path, lang)
@@ -730,9 +758,40 @@ def ocr_image_to_lines(img_path, scale, lang, stats):
             confs.append(conf)
             if conf < 60:
                 low.append(word)
+    # Font size from OCR boxes: a single word's box only covers its own ink, so x-height-only words
+    # ("sure", "on") look smaller than words with ascenders/descenders and whole body lines were
+    # mistaken for headings / footnotes.
+    #  - Latin line: ink extent of the whole line (ascender top .. descender bottom ~= 0.9 em);
+    #  - CJK line: median word height (ideographs all fill ~0.9 em; chi_sim sometimes returns a
+    #    bloated box, so max/union would overshoot);
+    #  - then one size per tesseract paragraph (its median). Latin lines always take it (a line
+    #    without descenders is ~20% shorter and must not split the paragraph); a CJK line only
+    #    when within 12% of it, because chi_sim often puts a footnote into the body paragraph.
+    def _is_cjk_line(ws):
+        txt = "".join(w["t"] for w in ws)
+        return len(_CJK_CHAR.findall(txt)) >= 0.5 * max(1, len(txt))
+
+    def _line_h(ws):
+        if _is_cjk_line(ws):
+            hs = sorted(w["y1"] - w["y0"] for w in ws)
+            return hs[len(hs) // 2]
+        return max(w["y1"] for w in ws) - min(w["y0"] for w in ws)
+    line_h = {key: _line_h(ws) for key, ws in groups.items()}
+    cjk_line = {key: _is_cjk_line(ws) for key, ws in groups.items()}
+    par_h = {}
+    for key, h in line_h.items():
+        par_h.setdefault(key[:2], []).append(h)
+    par_med = {k: sorted(v)[len(v) // 2] for k, v in par_h.items()}
     lines = []
     for key in sorted(groups):
         ws = sorted(groups[key], key=lambda w: w["x0"])
+        h, pm = line_h[key], par_med[key[:2]]
+        snap = not cjk_line[key] or (pm and abs(h - pm) <= 0.12 * pm)
+        size = (pm if snap else h) / _OCR_INK_TO_EM
+        for w in ws:
+            w["size"] = size
+        if any(k in lang for k in ("chi", "jpn", "kor")):
+            _ocr_cjk_punct(ws, stats)
         lines.append({"words": ws, "dir": "h"})
     mean = sum(confs) / len(confs) if confs else 0.0
     return lines, mean, len(confs), low
