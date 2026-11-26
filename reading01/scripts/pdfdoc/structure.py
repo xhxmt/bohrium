@@ -1,0 +1,994 @@
+"""Document assembly: blocks, block types, sections, references, continuation."""
+from __future__ import annotations
+
+import hashlib
+import os
+import re
+import time
+from collections import Counter, defaultdict
+
+from . import backends as B
+from . import layout as L
+from . import tables as T
+
+TERMINAL = tuple(".!?。！？:：;；")
+EQNUM_RE = re.compile(r"^\(\s*(?:[A-Z]\.?)?\d+(?:\.\d+)*[a-z]?\s*\)$|^（\s*\d+(?:\.\d+)*\s*）$")
+NUMBERED_HEAD_RE = re.compile(
+    r"^(?P<num>(?:\d{1,2}(?:\.\d{1,2}){0,4})\.?|[A-H](?:\.\d{1,2}){1,3}\.?|[IVXLC]{1,6}\.|[A-H]\.|[A-H](?=\s+[A-Z][a-z])|"
+    r"Appendix\s+[A-Z0-9]+[.:]?|附录\s*[A-Z0-9]*|第[一二三四五六七八九十百\d]+[章节部分]|"
+    r"[一二三四五六七八九十]+[、．.]|（[一二三四五六七八九十]+）)\s*(?P<title>\S.*)$")
+KNOWN_HEAD_RE = re.compile(
+    r"^(abstract|introduction|background|related\s+work|prior\s+work|preliminaries|methods?|methodology|"
+    r"materials\s+and\s+methods|experiments?|experimental(\s+section|\s+setup|\s+details)?|results?"
+    r"(\s+and\s+discussion)?|discussion|conclusions?(\s+and\s+future\s+work)?|summary|outlook|"
+    r"acknowledge?ments?|references|bibliography|works\s+cited|literature\s+cited|appendix|appendices|"
+    r"supplementary\s+(material|information|materials)|data\s+availability|code\s+availability|"
+    r"author\s+contributions|competing\s+interests|conflicts?\s+of\s+interest|funding|limitations|"
+    r"ethics\s+statement|keywords|index\s+terms|摘\s*要|关键词|引\s*言|前\s*言|参考文献|致\s*谢|结\s*论|"
+    r"附\s*录|讨\s*论|结果与讨论|实验部分|材料与方法)\s*[:.：]?$", re.I)
+REF_HEAD_RE = re.compile(r"^(\d+\.?\s*)?(references|bibliography|works\s+cited|literature\s+cited|"
+                         r"references\s+and\s+notes|参考文献)\s*[:.]?$", re.I)
+ABSTRACT_RUNIN_RE = re.compile(r"^(abstract|summary|摘\s*要)\s*([.:：—–-]|\s)\s*(?=\S)", re.I)
+REF_START_RE = re.compile(r"^(\[\d{1,4}\]|\d{1,4}\.\s|\(\d{1,4}\)\s|\[[A-Za-z][A-Za-z+\-]*\d{2,4}[a-z]?\])")
+BULLET_RE = re.compile(r"^([•◦▪●○■□–\-*]\s|\(?[a-z]\)\s|\(?\d{1,2}\)\s|[ivx]{1,4}\)\s)")
+
+
+def _sha256(path):
+    h = hashlib.sha256()
+    with open(path, "rb") as fh:
+        for chunk in iter(lambda: fh.read(1 << 20), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def parse_page_spec(spec, n):
+    if not spec:
+        return list(range(1, n + 1))
+    pages = set()
+    for part in str(spec).replace(" ", "").split(","):
+        if not part:
+            continue
+        if "-" in part:
+            a, b = part.split("-", 1)
+            a = int(a) if a else 1
+            b = int(b) if b else n
+            pages.update(range(max(1, a), min(n, b) + 1))
+        else:
+            k = int(part)
+            if 1 <= k <= n:
+                pages.add(k)
+    return sorted(pages)
+
+
+# --------------------------------------------------------------------------
+# main entry
+# --------------------------------------------------------------------------
+
+def parse_document(path, pages_spec=None, backend="auto", ocr="auto", ocr_lang="auto",
+                   workdir="/tmp/pdfdoc_work", ocr_budget_s=420, log=None, force_ocr=False):
+    t0 = time.time()
+    log = log or (lambda *a: None)
+    warnings = []
+    stats = {}
+    os.makedirs(workdir, exist_ok=True)
+    ext = os.path.splitext(path)[1].lower()
+    is_image = ext in (".png", ".jpg", ".jpeg", ".tif", ".tiff", ".bmp", ".gif", ".webp")
+    doc = {"schema": "pdfdoc/1", "source": {"file": os.path.abspath(path), "sha256": _sha256(path),
+                                            "bytes": os.path.getsize(path), "kind": "image" if is_image else "pdf"},
+           "engine": {"tools": B.detect_tools()}, "warnings": warnings}
+    if is_image:
+        n = 1
+        pages_list = [1]
+        bk = "ocr"
+        raw_pages = []
+    else:
+        n = B.page_count(path)
+        pages_list = parse_page_spec(pages_spec, n)
+        bk = B.choose_backend(backend)
+        if bk is None:
+            raise B.PDFOpenError("unsupported", "no PDF text engine available")
+        log("backend: %s, pages %s of %d" % (bk, _compact(pages_list), n))
+        raw_pages = getattr(B, "extract_" + bk)(path, pages_list, stats)
+    doc["source"]["pages_total"] = n
+    doc["source"]["pages_parsed"] = pages_list
+    doc["engine"]["backend"] = bk
+    # ---- text-layer quality, OCR where needed
+    need_ocr = []
+    pinfo = {}
+    for pg in raw_pages:
+        text = "".join(w["t"] for ln in pg["lines"] for w in ln["words"])
+        nchar = len(text)
+        bad = B.bad_char_count(text)
+        img_area = sum((r[2] - r[0]) * (r[3] - r[1]) for r in pg["images"])
+        cover = img_area / max(pg["width"] * pg["height"], 1.0)
+        status = "text"
+        if nchar < 25:
+            status = "no_text_layer" if (cover > 0.3 or bk != "pymupdf") else "empty"
+        elif bad > 0.15 * nchar:
+            status = "garbled_text_layer"
+        pinfo[pg["page"]] = {"page": pg["page"], "text_chars": nchar, "bad_chars": bad,
+                             "image_cover": round(cover, 2), "status": status, "source": pg["source"]}
+        if status in ("no_text_layer", "garbled_text_layer") or force_ocr:
+            need_ocr.append(pg["page"])
+    if is_image:
+        need_ocr = [1]
+    ocr_report = None
+    if need_ocr and ocr != "off":
+        log("OCR needed for pages %s" % _compact(need_ocr))
+        ocr_pages, ocr_report = B.ocr_pages(path, need_ocr, stats, os.path.join(workdir, "ocr"),
+                                            lang=ocr_lang, budget_s=ocr_budget_s, is_image=is_image)
+        byno = {p["page"]: p for p in ocr_pages}
+        newpages = []
+        if is_image:
+            newpages = ocr_pages
+            for p in ocr_pages:
+                pinfo[p["page"]] = {"page": p["page"], "status": "ocr", "source": p["source"]}
+        else:
+            for pg in raw_pages:
+                if pg["page"] in byno:
+                    o = byno[pg["page"]]
+                    pinfo[pg["page"]]["status"] = "ocr"
+                    pinfo[pg["page"]]["source"] = o["source"]
+                    pinfo[pg["page"]]["replaced_text_layer"] = pinfo[pg["page"]].get("text_chars", 0)
+                    newpages.append(o)
+                else:
+                    newpages.append(pg)
+        raw_pages = newpages
+        for p in (ocr_report or {}).get("skipped_pages", []):
+            warnings.append("page %d needs OCR but was not OCR'd (%s)" % (
+                p, "; ".join((ocr_report or {}).get("notes", [])) or "budget/engine"))
+            if p in pinfo:
+                pinfo[p]["status"] += "_unreadable"
+    elif need_ocr:
+        warnings.append("pages %s need OCR but OCR is disabled" % _compact(need_ocr))
+    doc["ocr"] = ocr_report
+    pages = raw_pages
+    # ---- segments, furniture, columns
+    for pg in pages:
+        L.build_segments(pg)
+    furniture = L.detect_furniture(pages)
+    body = L.body_font_size(pages)
+    colmap = L.detect_columns(pages)
+    lead = _leading_gap(pages, colmap, body)
+    doc["engine"]["body_font_size"] = body
+    # ---- regions + reading order
+    all_tables, all_figures, ordered_pages = [], [], []
+    side_votes, side_pref = Counter(), None
+    gutter_splits = 0
+    for pg in pages:
+        gutter_splits += L.split_gutter_crossers(pg, colmap[pg["page"]])
+    for pg in pages:
+        ci = colmap[pg["page"]]
+        cols = L.column_intervals(ci)
+        tabs, figs, caps = T.find_regions(pg, cols, ci, body, lead, prefer=side_pref)
+        if tabs:
+            side_votes[pg.get("table_caption_side", "below")] += 1
+            side_pref = side_votes.most_common(1)[0][0]
+        items = [s for s in pg["segs"] if s["role"] is None]
+        for tb in tabs:
+            reg = _region_item(pg["page"], "table", tb, [tb["caption"]])
+            items.append(reg)
+        for fg in figs:
+            reg = _region_item(pg["page"], "figure", fg, [fg["caption"]])
+            items.append(reg)
+        # captions of other kinds (algorithms) become caption items
+        ordered = L.order_items(items, cols)
+        ordered_pages.append((pg, cols, ordered))
+        all_tables.extend(tabs)
+        all_figures.extend(figs)
+        pi = pinfo.setdefault(pg["page"], {"page": pg["page"]})
+        pi.update({"width": round(pg["width"], 1), "height": round(pg["height"], 1),
+                   "columns": len(cols), "gutters": [round(g, 1) for g in ci["gutters"]],
+                   "column_source": ci["source"], "notes": pg.get("notes", [])})
+        pi.setdefault("source", pg["source"])
+    # ---- blocks
+    blocks = _form_blocks(ordered_pages, body, lead)
+    vocab = _vocabulary(pages)
+    changes = {"dehyphenation": [], "ligatures_expanded": stats.get("ligatures", 0),
+               "invisible_chars_removed": stats.get("invisible_chars", 0),
+               "ocr_numeric_corrections": stats.get("ocr_corrections", [])[:200],
+               "furniture_removed": len(furniture), "merged_paragraphs": [],
+               "lines_split_at_column_gutter": gutter_splits}
+    for b in blocks:
+        if b["kind"] == "text":
+            _block_text(b, vocab, changes)
+    _classify(blocks, body, pages_list)
+    blocks = [b for b in blocks if b.get("type") != "merged"]
+    for i, b in enumerate(blocks):
+        b["order"] = i
+    sections = _sections(blocks)
+    refs = _references(blocks, body)
+    _continuations(blocks, changes)
+    equations = _equations(blocks)
+    tables_out = _tables_out(all_tables, blocks)
+    figures_out = _figures_out(all_figures, blocks)
+    footnotes = [{"id": b["id"], "page": b["page"], "bbox": _bb(b), "text": b["text"]}
+                 for b in blocks if b["type"] == "footnote"]
+    meta = _metadata(blocks)
+    # ---- warnings / quality
+    for p, info in sorted(pinfo.items()):
+        if info.get("status", "text") not in ("text", "ocr"):
+            warnings.append("page %d: %s" % (p, info["status"]))
+    for tb in tables_out:
+        if tb.get("image_only"):
+            warnings.append("%s (page %d): caption found but no table text; table may be an image" % (tb["label"], tb["page"]))
+    doc.update({
+        "pages": [pinfo[k] for k in sorted(pinfo)],
+        "metadata": meta,
+        "sections": sections,
+        "blocks": [_public_block(b) for b in blocks],
+        "tables": tables_out,
+        "figures": figures_out,
+        "equations": equations,
+        "footnotes": footnotes,
+        "references": refs,
+        "furniture": furniture,
+        "changes": changes,
+    })
+    doc["engine"]["elapsed_s"] = round(time.time() - t0, 2)
+    return doc
+
+
+def _compact(nums):
+    nums = sorted(nums)
+    out, i = [], 0
+    while i < len(nums):
+        j = i
+        while j + 1 < len(nums) and nums[j + 1] == nums[j] + 1:
+            j += 1
+        out.append(str(nums[i]) if i == j else "%d-%d" % (nums[i], nums[j]))
+        i = j + 1
+    return ",".join(out)
+
+
+def _region_item(page, kind, obj, extra):
+    xs0 = [obj["x0"]] + [e["x0"] for e in extra]
+    ys0 = [obj["y0"]] + [e["y0"] for e in extra]
+    xs1 = [obj["x1"]] + [e["x1"] for e in extra]
+    ys1 = [obj["y1"]] + [e["y1"] for e in extra]
+    return {"region": kind, "obj": obj, "page": page, "x0": min(xs0), "y0": min(ys0),
+            "x1": max(xs1), "y1": max(ys1), "role": "region", "text": "", "size": 0}
+
+
+def _leading_gap(pages, colmap, body):
+    gaps = []
+    for pg in pages:
+        cols = L.column_intervals(colmap[pg["page"]])
+        segs = sorted([s for s in pg["segs"] if s["role"] is None and s["dir"] == "h" and abs(s["size"] - body) < 0.6],
+                      key=lambda s: (L.assign_column(s, cols), s["y0"]))
+        for a, b in zip(segs, segs[1:]):
+            if L.assign_column(a, cols) == L.assign_column(b, cols):
+                g = b["y0"] - a["y1"]
+                if -2 < g < 1.5 * body:
+                    gaps.append(g)
+    return L._median(gaps, 0.15 * body)
+
+
+# --------------------------------------------------------------------------
+# block formation
+# --------------------------------------------------------------------------
+
+def _col_edges(rows, cols):
+    edges = {}
+    by = defaultdict(list)
+    for r in rows:
+        if r.get("region"):
+            continue
+        by[r["col"]].append(r)
+    for c, items in by.items():
+        if c == -1 or not items:
+            continue
+        width = cols[c][1] - cols[c][0]
+        wide = [s for s in items if (s["x1"] - s["x0"]) > 0.6 * width] or items
+        x0s = sorted(s["x0"] for s in wide)
+        x1s = sorted(s["x1"] for s in wide)
+        edges[c] = (x0s[len(x0s) // 5], x1s[(len(x1s) * 4) // 5])
+    return edges
+
+
+def _make_rows(ordered):
+    """Merge segments of one visual line (same column/band) into rows."""
+    rows = []
+    for it in ordered:
+        if it.get("region"):
+            rows.append(it)
+            continue
+        if rows and not rows[-1].get("region"):
+            r = rows[-1]
+            h = max(min(it["y1"] - it["y0"], r["y1"] - r["y0"]), 1.0)
+            ov = min(it["y1"], r["y1"]) - max(it["y0"], r["y0"])
+            if it["col"] == r["col"] and it.get("band") == r.get("band") and ov > 0.45 * h and it["x0"] >= r["x1"] - 2:
+                r["segs"].append(it)
+                r["x1"] = max(r["x1"], it["x1"])
+                r["y0"] = min(r["y0"], it["y0"])
+                r["y1"] = max(r["y1"], it["y1"])
+                continue
+        rows.append({"segs": [it], "x0": it["x0"], "y0": it["y0"], "x1": it["x1"], "y1": it["y1"],
+                     "col": it["col"], "band": it.get("band"), "page": it["page"]})
+    for r in rows:
+        if r.get("region"):
+            continue
+        segs = r["segs"]
+        parts, rparts = [], []
+        for i, s in enumerate(segs):
+            if i:
+                gap = s["x0"] - segs[i - 1]["x1"]
+                sep = "  " if gap > 3.0 * max(s["size"], 1) else " "
+                parts.append(sep)
+                rparts.append(sep)
+            parts.append(s["text"])
+            rparts.append(L.rich_words(s["words"]))
+        r["text"] = "".join(parts)
+        r["rich"] = "".join(rparts)
+        nch = Counter()
+        for s in segs:
+            nch[round(s["size"], 1)] += len(s["text"])
+        r["size"] = nch.most_common(1)[0][0]
+        tot = float(sum(len(s["text"]) for s in segs)) or 1.0
+        words = [w for s in segs for w in s["words"]]
+        wtot = float(sum(len(w["t"]) for w in words)) or 1.0
+        bfrac = sum(len(w["t"]) for w in words if w["bold"]) / wtot
+        r["bold"] = bfrac > 0.85
+        lead = []
+        for w in words:
+            if w["bold"]:
+                lead.append(w)
+            else:
+                break
+        r["lead"] = L.join_words(lead) if (lead and len(lead) < len(words) and len(lead) <= 10) else None
+        r["math_font"] = sum(s["math_font"] * len(s["text"]) for s in segs) / tot
+        r["sym"] = sum(s["sym"] * len(s["text"]) for s in segs) / tot
+        r["eqnum"] = len(segs) >= 1 and bool(EQNUM_RE.match(segs[-1]["text"].strip()))
+        confs = [s["conf"] for s in segs if s.get("conf") is not None]
+        r["conf"] = sum(confs) / len(confs) if confs else None
+    return rows
+
+
+def _row_mathy(r, edges, body):
+    t = r["text"].strip()
+    if EQNUM_RE.match(t):
+        return True
+    left, right = edges.get(r["col"], (r["x0"], r["x1"]))
+    centered = (r["x0"] - left) > 1.0 * body and (right - r["x1"]) > 1.0 * body
+    body_t = t
+    if r["eqnum"] and len(r["segs"]) > 1:
+        body_t = " ".join(s["text"] for s in r["segs"][:-1])
+        if r["segs"][-1]["x1"] > right - 2.5 * body:
+            centered = centered or (r["segs"][0]["x0"] - left) > 1.0 * body
+    words = body_t.split()
+    longwords = sum(1 for w in words if re.match(r"^[A-Za-z]{4,}[,.;:]?$", w))
+    mathish = r["math_font"] >= 0.3 or r["sym"] >= 0.12 or bool(re.search(r"[=≤≥≈∝∈∑∏∫]", body_t))
+    if r["eqnum"] and len(r["segs"]) > 1 and mathish and longwords <= max(4, len(words) // 2):
+        return True
+    return centered and mathish and longwords <= max(3, len(words) // 3)
+
+
+def _row_headish(r, body):
+    t = r["text"].strip()
+    first = r["segs"][0]["words"][0]
+    if first.get("pieces") and first["pieces"][0][1] == "sup":
+        return False  # "¹University of ..." affiliation / footnote line
+    if r.get("lead") and not NUMBERED_HEAD_RE.match(t) and not KNOWN_HEAD_RE.match(t):
+        return False  # bold run-in lead followed by body text: a paragraph, not a heading
+    pseudo = {"text": t, "bold": r["bold"], "size": r["size"]}
+    return _is_heading_seg(pseudo, body)
+
+
+def _is_heading_seg(s, body):
+    t = re.sub(r"\s+", " ", s["text"].strip())
+    if len(t) > 160 or len(t) < 2:
+        return False
+    if s["size"] < 0.95 * body:
+        return False  # headings are never set smaller than the body text
+    if re.search(r"\bet al\b|\d{3,}.*\d{3,}|\b(Phys|Rev|Lett|J\.|Proc)\.", t) and not s["bold"]:
+        return False
+    nw = len(t.split())
+    if KNOWN_HEAD_RE.match(t) and (s["bold"] or s["size"] >= body * 1.05 or t.isupper() or nw <= 3):
+        return True
+    m = NUMBERED_HEAD_RE.match(t)
+    if m and nw <= 16:
+        title = m.group("title")
+        ends_period = t.endswith(".") and not re.match(r"^[\dIVXLC.]+\.?$", t)
+        first = title[:1]
+        if (first.isupper() or L.is_cjk(first)) and not ends_period and not re.match(r"^\d", title) \
+                and not re.search(r"\d\s*%|\b(GHz|MHz|mm|cm|nm|kg|mg|ml|mL|K|°C)\b", t[:12]):
+            if s["bold"] or s["size"] >= body * 1.05 or title.isupper() or _smallcaps_like(title):
+                return True
+            if nw <= 8 and _title_case(title):
+                return True
+    if s["bold"] and nw <= 12 and not t.endswith((".", ",", ";")) and s["size"] >= body * 0.95 and \
+            (t[:1].isupper() or L.is_cjk(t[:1])):
+        return True
+    if s["size"] >= body * 1.18 and nw <= 14 and not t.endswith("."):
+        return True
+    return False
+
+
+def _title_case(t):
+    words = [w for w in re.findall(r"[A-Za-z][A-Za-z\-]*", t) if len(w) >= 3 or w[0].isupper()]
+    if not words:
+        return bool(L.CJK_RE.search(t))
+    caps = sum(1 for w in words if w[0].isupper() or w.lower() in ("of", "and", "the", "for", "in", "on", "to", "a", "an", "with", "via", "vs"))
+    return caps >= 0.8 * len(words)
+
+
+def _smallcaps_like(t):
+    letters = [c for c in t if c.isalpha()]
+    return bool(letters) and sum(1 for c in letters if c.isupper()) > 0.8 * len(letters)
+
+
+def _form_blocks(ordered_pages, body, lead):
+    blocks = []
+    for pg, cols, ordered in ordered_pages:
+        rows = _make_rows(ordered)
+        edges = _col_edges(rows, cols)
+        pno = pg["page"]
+        start = len(blocks)
+        cur = None
+        prev = None
+        for r in rows:
+            if r.get("region"):
+                if cur:
+                    blocks.append(cur)
+                blocks.append({"kind": "region", "region": r["region"], "obj": r["obj"], "page": pno,
+                               "rows": [], "col": r["col"], "band": r.get("band"),
+                               "x0": r["x0"], "y0": r["y0"], "x1": r["x1"], "y1": r["y1"]})
+                cur, prev = None, None
+                continue
+            r["mathy"] = _row_mathy(r, edges, body)
+            r["headish"] = _row_headish(r, body) and not r["mathy"]
+            if cur is None or prev is None:
+                cur = _new_block(r, pno)
+                prev = r
+                continue
+            brk = False
+            size = max(r["size"], 1.0)
+            gap = r["y0"] - prev["y1"]
+            left, right = edges.get(r["col"], (r["x0"], r["x1"]))
+            width = max(right - left, 1.0)
+            if r["col"] != prev["col"] or (r["col"] != -1 and r.get("band") != prev.get("band")):
+                brk = True
+            elif prev["headish"] and r["headish"]:
+                numbered = bool(NUMBERED_HEAD_RE.match(r["text"].strip())) or KNOWN_HEAD_RE.match(r["text"].strip())
+                brk = numbered or abs(r["size"] - prev["size"]) > 0.08 * size or r["bold"] != prev["bold"] \
+                    or gap > lead + 0.4 * size or len(cur["rows"]) >= 3
+            elif abs(r["size"] - prev["size"]) > 0.12 * max(r["size"], prev["size"]):
+                brk = True
+            elif gap > lead + 0.5 * size:
+                brk = True
+            elif r["headish"] or prev["headish"] or r["mathy"] != prev["mathy"]:
+                brk = True
+            elif cur["type_hint"] == "caption_like":
+                brk = False
+            else:
+                pt = prev["text"].rstrip()
+                indent = r["x0"] - left
+                prev_short = prev["x1"] < right - 0.12 * width
+                if 0.7 * size < indent < 6 * size and (pt.endswith(TERMINAL) or prev_short) and prev["x0"] - left < 0.7 * size:
+                    brk = True
+                elif pt.endswith(TERMINAL) and prev_short:
+                    brk = True
+                elif BULLET_RE.match(r["text"]) and pt.endswith(TERMINAL + (",",)):
+                    brk = True
+                elif REF_START_RE.match(r["text"]) and pt.endswith((".", "]")) and prev_short:
+                    brk = True
+            if brk:
+                blocks.append(cur)
+                cur = _new_block(r, pno)
+            else:
+                cur["rows"].append(r)
+                cur["x0"] = min(cur["x0"], r["x0"])
+                cur["y0"] = min(cur["y0"], r["y0"])
+                cur["x1"] = max(cur["x1"], r["x1"])
+                cur["y1"] = max(cur["y1"], r["y1"])
+            prev = r
+        if cur:
+            blocks.append(cur)
+        for k, b in enumerate(blocks[start:]):
+            b["id"] = "p%d-b%d" % (pno, k)
+            b["edges"] = edges.get(b["col"])
+            b["page_h"] = pg["height"]
+            b["page_w"] = pg["width"]
+            b["rules"] = pg.get("rules", [])
+    for i, b in enumerate(blocks):
+        b["order"] = i
+    return blocks
+
+
+def _new_block(r, pno):
+    hint = "caption_like" if T.caption_info(r["segs"][0]) else None
+    return {"kind": "text", "page": pno, "rows": [r], "col": r["col"], "band": r.get("band"),
+            "x0": r["x0"], "y0": r["y0"], "x1": r["x1"], "y1": r["y1"], "type_hint": hint,
+            "lead": r.get("lead")}
+
+
+# --------------------------------------------------------------------------
+# text assembly (dehyphenation, CJK joins, sup/sub markup)
+# --------------------------------------------------------------------------
+
+def _vocabulary(pages):
+    v = Counter()
+    for pg in pages:
+        for s in pg.get("segs", []):
+            ws = s["text"].split()
+            for w in ws[:-1]:
+                v[re.sub(r"^[^\w]+|[^\w\-]+$", "", w).lower()] += 1
+    return v
+
+
+def _dehyphen_pair(text, rich, plain, rch, vocab, changes, block_id):
+    m = re.search(r"([A-Za-z]+)-$", text)
+    nxt = re.match(r"^([a-z][A-Za-z]*)", plain)
+    if m and nxt and not text.endswith("--"):
+        left, right = m.group(1), nxt.group(1)
+        joined, hyph = (left + right).lower(), (left + "-" + right).lower()
+        keep = vocab.get(hyph, 0) > vocab.get(joined, 0)
+        if changes is not None:
+            changes["dehyphenation"].append({
+                "block": block_id, "from": left + "-|" + right,
+                "to": (left + "-" + right) if keep else (left + right),
+                "rule": ("kept hyphen" if keep else "removed hyphen") +
+                        (" (form seen in document)" if (vocab.get(hyph) or vocab.get(joined)) else " (default)")})
+        if keep:
+            return text + plain, rich + rch
+        return text[:-1] + plain, rich[:-1] + rch
+    if text and plain and L.is_cjk(text[-1]) and L.is_cjk(plain[0]):
+        return text + plain, rich + rch
+    return text + " " + plain, rich + " " + rch
+
+
+def _join_lines(lines, vocab, changes, block_id):
+    text, rich = "", ""
+    for plain, rch in lines:
+        if not text:
+            text, rich = plain, rch
+        else:
+            text, rich = _dehyphen_pair(text, rich, plain, rch, vocab, changes, block_id)
+    return text, rich
+
+
+def _block_text(b, vocab, changes):
+    b["lines"] = [{"plain": r["text"], "rich": r["rich"], "segs": r["segs"], "x0": r["x0"], "y0": r["y0"],
+                   "x1": r["x1"], "y1": r["y1"]} for r in b["rows"]]
+    b["segs"] = [s for r in b["rows"] for s in r["segs"]]
+    text, rich = _join_lines([(ln["plain"], ln["rich"]) for ln in b["lines"]], vocab, changes, b.get("id"))
+    b["text"] = text
+    b["rich"] = rich
+    sizes = Counter()
+    for s in b["segs"]:
+        sizes[round(s["size"], 1)] += len(s["text"])
+    b["size"] = sizes.most_common(1)[0][0] if sizes else 0
+    tot = max(1, sum(len(s["text"]) for s in b["segs"]))
+    b["bold"] = sum(len(s["text"]) for s in b["segs"] if s["bold"]) > 0.6 * tot
+    confs = [s["conf"] for s in b["segs"] if s.get("conf") is not None]
+    b["ocr_conf"] = round(sum(confs) / len(confs), 1) if confs else None
+
+
+# --------------------------------------------------------------------------
+# classification
+# --------------------------------------------------------------------------
+
+def _classify(blocks, body, pages_list):
+    for b in blocks:
+        if b["kind"] == "region":
+            b["type"] = b["region"]
+            continue
+        b["type"] = "paragraph"
+        segs = b["segs"]
+        t = b["text"].strip()
+        if not t:
+            b["type"] = "empty"
+            continue
+        if b["type_hint"] == "caption_like":
+            ci = T.caption_info(segs[0])
+            if ci and ci[2]:
+                b["type"] = "caption"
+                b["caption_kind"], b["caption_number"] = ci[0], ci[1]
+                continue
+        rows = b["rows"]
+        mathy = sum(1 for r in rows if r.get("mathy"))
+        if mathy >= max(1, 0.6 * len(rows)) and len(t) < 800:
+            b["type"] = "equation"
+            continue
+        if len(rows) <= 3 and rows[0].get("headish") and len(t) <= 200:
+            b["type"] = "heading"
+            continue
+        if BULLET_RE.match(t):
+            b["type"] = "list_item"
+    # title on the first page of the document
+    first = [b for b in blocks if b["page"] == 1 and b["kind"] == "text" and b["type"] in ("paragraph", "heading")
+             and b["y0"] < 0.45 * b["page_h"] and L.tlen(b.get("text", "").replace(" ", "")) >= 8
+             and not NUMBERED_HEAD_RE.match(b.get("text", "")) and not KNOWN_HEAD_RE.match(b.get("text", "").strip())]
+    if first and 1 in pages_list:
+        big = max(first, key=lambda b: (b["size"], -b["y0"]))
+        if big["size"] >= body * 1.15 and len(big["text"]) < 300:
+            big["type"] = "title"
+            title_idx = big["order"]
+            for nb in blocks[big["order"] + 1:]:
+                if nb["page"] != 1 or nb["kind"] != "text" or abs(nb["size"] - big["size"]) > 0.08 * big["size"] \
+                        or nb["y0"] - big["y1"] > 1.2 * big["size"]:
+                    break
+                big["rows"].extend(nb["rows"])
+                big["lines"].extend(nb["lines"])
+                big["segs"].extend(nb["segs"])
+                big["text"] += " " + nb["text"]
+                big["rich"] += " " + nb["rich"]
+                big["x0"], big["y0"] = min(big["x0"], nb["x0"]), min(big["y0"], nb["y0"])
+                big["x1"], big["y1"] = max(big["x1"], nb["x1"]), max(big["y1"], nb["y1"])
+                nb["type"] = "merged"
+                nb["merged_into"] = big["id"]
+            # front matter: page-1 blocks after the title until abstract / first real heading
+            for b in blocks:
+                if b["page"] != 1 or b["order"] <= title_idx or b["kind"] != "text":
+                    continue
+                t = b.get("text", "").strip()
+                if b["type"] == "heading" and (KNOWN_HEAD_RE.match(t) or NUMBERED_HEAD_RE.match(t)):
+                    break
+                if ABSTRACT_RUNIN_RE.match(t):
+                    break
+                if b["type"] == "paragraph" and len(t.split()) > 40:
+                    break
+                if b["type"] in ("paragraph", "heading", "equation") and len(t) < 400 and b["size"] <= big["size"]:
+                    b["type"] = "front_matter"
+    # abstract
+    found_abs = False
+    for i, b in enumerate(blocks):
+        if b["kind"] != "text":
+            continue
+        t = b["text"].strip()
+        if b["type"] == "heading" and re.match(r"^(abstract|summary|摘\s*要)\s*[:.：]?$", t, re.I):
+            for nb in blocks[i + 1:]:
+                if nb["kind"] != "text" or nb["type"] in ("heading", "title"):
+                    break
+                if nb["type"] in ("paragraph", "front_matter"):
+                    nb["type"] = "abstract"
+                    found_abs = True
+                elif nb["type"] not in ("footnote", "caption"):
+                    break
+            break
+        if b["page"] <= 2 and b["type"] in ("paragraph", "front_matter") and ABSTRACT_RUNIN_RE.match(t):
+            b["type"] = "abstract"
+            b["runin_label"] = ABSTRACT_RUNIN_RE.match(t).group(1)
+            found_abs = True
+            break
+    if not found_abs:
+        cands = [b for b in blocks if b["page"] == 1 and b["kind"] == "text" and b["type"] in ("paragraph", "front_matter")
+                 and len(b["text"].split()) >= 50]
+        if cands:
+            b = cands[0]
+            if b["col"] == -1 or b["order"] <= min(x["order"] for x in cands):
+                b["type"] = "abstract"
+                b["inferred"] = True
+    for b in blocks:
+        if b.get("kind") == "text" and b["type"] in ("paragraph", "front_matter") and \
+                re.match(r"^(keywords|key\s+words|index\s+terms|关键词)\s*[:：—–-]", b["text"].strip(), re.I):
+            b["type"] = "keywords"
+    # footnotes: small text at the bottom of a column with nothing below
+    bycol = defaultdict(list)
+    for b in blocks:
+        if b["kind"] == "text":
+            bycol[(b["page"], b["col"])].append(b)
+    for key, lst in bycol.items():
+        lst.sort(key=lambda b: b["y0"])
+        for b in reversed(lst):
+            if b["type"] not in ("paragraph", "front_matter", "list_item"):
+                break
+            if b["y0"] < 0.55 * b["page_h"] or b["size"] > body * 0.92:
+                break
+            t = b["text"].strip()
+            if re.match(r"^([\d*†‡§¶#]|[a-z]\s)", t) or any(abs(r[3] - b["y0"]) < 8 and (r[2] - r[0]) < 0.6 * b["page_w"]
+                                                           for r in b.get("rules", [])) or b["size"] <= body * 0.85:
+                b["type"] = "footnote"
+            else:
+                break
+    # heading levels
+    heads = [b for b in blocks if b.get("type") == "heading"]
+    roman = any(re.match(r"^[IVXLC]+\.\s", b["text"]) for b in heads)
+    sizes = sorted(set(round(b["size"]) for b in heads if not NUMBERED_HEAD_RE.match(b["text"])), reverse=True)
+    for b in heads:
+        t = b["text"].strip()
+        m = NUMBERED_HEAD_RE.match(t)
+        lvl, num, title = None, None, t
+        if m and not KNOWN_HEAD_RE.match(t):
+            num = m.group("num").rstrip(".")
+            title = m.group("title")
+            if re.match(r"^\d+(\.\d+)*$", num):
+                lvl = num.count(".") + 1
+            elif re.match(r"^[IVXLC]+$", num):
+                lvl = 1
+            elif re.match(r"^[A-H]$", num):
+                lvl = 2 if roman else 1
+            elif re.match(r"^[A-H](\.\d+)+$", num):
+                lvl = num.count(".") + 1
+            elif num.startswith("Appendix") or num.startswith("附录"):
+                lvl = 1
+            elif num.startswith("第"):
+                lvl = 1 if ("章" in num or "部分" in num) else 2
+            elif num.startswith("（"):
+                lvl = 2
+            else:
+                lvl = 1
+        elif KNOWN_HEAD_RE.match(t):
+            lvl = 1
+        else:
+            r = sizes.index(round(b["size"])) if round(b["size"]) in sizes else len(sizes)
+            lvl = min(1 + r + (0 if b["size"] > body * 1.1 else 1), 4)
+        b["level"], b["number"], b["title"] = lvl, num, title
+
+
+def _sections(blocks):
+    sections, stack = [], []
+    for b in blocks:
+        if b.get("type") == "heading":
+            while stack and stack[-1]["level"] >= b["level"]:
+                stack.pop()
+            sid = "sec-%d" % (len(sections) + 1)
+            sec = {"id": sid, "level": b["level"], "number": b.get("number"), "title": b.get("title", b["text"]),
+                   "heading_text": b["text"], "page": b["page"], "block": b["id"], "bbox": _bb(b),
+                   "parent": stack[-1]["id"] if stack else None}
+            sections.append(sec)
+            stack.append(sec)
+            b["section"] = sid
+        else:
+            b["section"] = stack[-1]["id"] if stack else None
+    return sections
+
+
+def _bb(o):
+    return [round(o["x0"], 1), round(o["y0"], 1), round(o["x1"], 1), round(o["y1"], 1)]
+
+
+# --------------------------------------------------------------------------
+# references
+# --------------------------------------------------------------------------
+
+def _references(blocks, body):
+    start = None
+    for i, b in enumerate(blocks):
+        if b.get("type") == "heading" and REF_HEAD_RE.match(b["text"].strip()):
+            start = i
+    if start is None:
+        # no "References" heading (e.g. revtex letters): find the longest run of
+        # text blocks whose lines mostly start with [n] / n. labels
+        flags = []
+        for b in blocks:
+            isref = b.get("kind") == "text" and b.get("type") in ("paragraph", "list_item", "footnote", "heading") and \
+                sum(1 for ln in b["lines"] if REF_START_RE.match(ln["plain"])) >= max(1, 0.3 * len(b["lines"]))
+            cont = b.get("kind") == "text" and b.get("type") in ("paragraph", "list_item", "footnote") and len(b["lines"]) <= 3
+            flags.append(2 if isref else (1 if cont else 0))
+        # a continuation block counts only when reference blocks surround it (gap <= 2)
+        best, run = None, []
+        i = 0
+        while i <= len(flags):
+            f = flags[i] if i < len(flags) else 0
+            if f == 2:
+                run.append(i)
+                i += 1
+                continue
+            if f == 1 and run:
+                j = i
+                while j < len(flags) and flags[j] == 1 and j - i < 2:
+                    j += 1
+                if j < len(flags) and flags[j] == 2:
+                    run.extend(range(i, j))
+                    i = j
+                    continue
+            if run and (best is None or len(run) > len(best)):
+                best = run
+            run = []
+            i += 1
+        if not best or sum(len(blocks[i]["lines"]) for i in best) < 6:
+            return []
+        start = best[0] - 1
+        ref_level = 0
+        region = [blocks[i] for i in best]
+        return _split_refs(region, body)
+    ref_level = blocks[start].get("level", 1)
+    region = []
+    for b in blocks[start + 1:]:
+        if b.get("type") == "heading" and b.get("level", 1) <= ref_level and not REF_START_RE.match(b["text"]):
+            break
+        if b["kind"] == "text" and b["type"] in ("paragraph", "list_item", "footnote", "heading", "front_matter"):
+            region.append(b)
+    return _split_refs(region, body)
+
+
+def _split_refs(region, body):
+    lines = []
+    for b in region:
+        b["type"] = "reference"
+        for ln in b["lines"]:
+            lines.append((b, ln))
+    if not lines:
+        return []
+    numeric = sum(1 for _, ln in lines if REF_START_RE.match(ln["plain"])) >= max(2, 0.15 * len(lines))
+    entries = []
+    cur = None
+    # hanging-indent detection per column
+    lefts = defaultdict(list)
+    for b, ln in lines:
+        lefts[(b["page"], b["col"])].append(ln["x0"])
+    colleft = {k: min(v) for k, v in lefts.items()}
+    for b, ln in lines:
+        left = colleft[(b["page"], b["col"])]
+        if numeric:
+            starts = bool(REF_START_RE.match(ln["plain"]))
+        else:
+            starts = ln["x0"] - left < 0.6 * body
+        if starts or cur is None:
+            if cur:
+                entries.append(cur)
+            cur = {"lines": [(b, ln)]}
+        else:
+            cur["lines"].append((b, ln))
+    if cur:
+        entries.append(cur)
+    out = []
+    for k, e in enumerate(entries):
+        txt = ""
+        for _, ln in e["lines"]:
+            p = ln["plain"]
+            if txt.endswith("-") and p[:1].islower():
+                txt = txt[:-1] + p
+            elif txt:
+                txt += " " + p
+            else:
+                txt = p
+        m = REF_START_RE.match(txt)
+        label = m.group(1).strip() if (m and numeric) else str(k + 1)
+        year = re.search(r"\b(19|20)\d{2}[a-z]?\b", txt)
+        doi = re.search(r"\b10\.\d{4,9}/[^\s,;]+", txt)
+        arx = re.search(r"arXiv[:\s]*(\d{4}\.\d{4,5})(v\d+)?", txt, re.I)
+        b0 = e["lines"][0][0]
+        segs_bb = [ln for _, ln in e["lines"]]
+        out.append({"id": "ref-%d" % (k + 1), "label": label, "text": txt.strip(),
+                    "page": b0["page"], "block": b0["id"],
+                    "pages": sorted(set(b["page"] for b, _ in e["lines"])),
+                    "bbox": [round(min(l["x0"] for l in segs_bb), 1), round(min(l["y0"] for l in segs_bb), 1),
+                             round(max(l["x1"] for l in segs_bb), 1), round(max(l["y1"] for l in segs_bb), 1)],
+                    "year": year.group(0) if year else None, "doi": doi.group(0).rstrip(".") if doi else None,
+                    "arxiv": arx.group(1) if arx else None,
+                    "split_rule": "numbered labels" if numeric else "hanging indent"})
+    return out
+
+
+# --------------------------------------------------------------------------
+# continuation across columns / pages
+# --------------------------------------------------------------------------
+
+def _continuations(blocks, changes):
+    flow = [b for b in blocks if b["kind"] == "text" and b["type"] in ("paragraph", "list_item", "abstract")]
+    skip_types = ("figure", "table", "caption", "footnote", "empty")
+    for a, b in zip(flow, flow[1:]):
+        if (a["page"], a["col"], a.get("band")) == (b["page"], b["col"], b.get("band")):
+            continue
+        # everything between them in reading order must be non-flow material
+        between = blocks[a["order"] + 1:b["order"]]
+        if any(x.get("type") not in skip_types for x in between):
+            continue
+        at = re.sub(r"(?<=[.!?。！？])\s*[\d*†‡§]{1,3}$", "", a["text"].rstrip())
+        bt = b["text"].lstrip()
+        if not at or not bt:
+            continue
+        ends_open = not at.endswith(TERMINAL) or at.endswith("-")
+        lower_start = bt[:1].islower() or (L.is_cjk(bt[:1]) and not at.endswith(("。", "！", "？")))
+        edges = b.get("edges")
+        not_indented = edges is not None and (b["segs"][0]["x0"] - edges[0]) < 0.6 * b["segs"][0]["size"]
+        if ends_open and (lower_start or (not_indented and not bt[:1].isdigit())):
+            b["continues"] = a["id"]
+            a["continued_by"] = b["id"]
+            changes["merged_paragraphs"].append({"from": a["id"], "to": b["id"],
+                                                 "reason": "paragraph runs across %s" % (
+                                                     "pages" if a["page"] != b["page"] else "columns"),
+                                                 "join": at[-25:] + " ‖ " + bt[:25]})
+
+
+# --------------------------------------------------------------------------
+# outputs: equations, tables, figures, metadata
+# --------------------------------------------------------------------------
+
+def _equations(blocks):
+    eqs = []
+    for b in blocks:
+        if b.get("type") != "equation":
+            continue
+        nums = []
+        body_parts = []
+        for ln in b["lines"]:
+            for s in ln["segs"]:
+                if EQNUM_RE.match(s["text"].strip()):
+                    nums.append(s["text"].strip())
+                else:
+                    body_parts.append(L.rich_words(s["words"]))
+        b["eq_numbers"] = nums
+        eqs.append({"id": "eq-%d" % (len(eqs) + 1), "number": ", ".join(nums) if nums else None,
+                    "page": b["page"], "block": b["id"], "bbox": _bb(b), "text": b["text"],
+                    "text_rich": " ".join(body_parts),
+                    "note": "linearised from the text layer; verify symbols against the rendered crop"})
+    return eqs
+
+
+def _tables_out(tabs, blocks):
+    out = []
+    regmap = {id(b["obj"]): b for b in blocks if b["kind"] == "region"}
+    seen = Counter()
+    for tb in sorted(tabs, key=lambda t: (t["page"], t["y0"], t["x0"])):
+        seen[tb["number"]] += 1
+        rb = regmap.get(id(tb))
+        cap = tb["caption"]
+        o = {"id": "table-%s%s" % (tb["number"], "" if seen[tb["number"]] == 1 else "-part%d" % seen[tb["number"]]),
+             "label": "Table " + tb["number"] if not cap["text"].startswith("表") else "表" + tb["number"],
+             "number": tb["number"], "page": tb["page"], "block": rb["id"] if rb else None,
+             "bbox": [round(tb["x0"], 1), round(tb["y0"], 1), round(tb["x1"], 1), round(tb["y1"], 1)],
+             "caption": {"text": cap["text"], "bbox": _bb(cap), "position": tb.get("caption_side")},
+             "nrows": tb.get("nrows", 0), "ncols": tb.get("ncols", 0), "header_rows": tb.get("header_rows", 0),
+             "grid": tb.get("grid", []), "issues": tb.get("issues", []) + tb.get("notes", []),
+             "image_only": tb.get("image_only", False), "ruling_lines_used": tb.get("rules_used", False)}
+        if seen[tb["number"]] > 1:
+            o["continued_from"] = "table-%s" % tb["number"]
+            o["issues"].append("same table number seen earlier: treated as continuation (cross-page table)")
+        o["markdown"] = T.table_markdown(tb) if tb.get("grid") else ""
+        o["html"] = T.table_html(tb) if tb.get("grid") else ""
+        o["matrix"] = T.table_matrix(tb) if tb.get("grid") else []
+        o["header"] = T.flat_header(tb) if tb.get("grid") else []
+        out.append(o)
+    return out
+
+
+def _figures_out(figs, blocks):
+    out = []
+    regmap = {id(b["obj"]): b for b in blocks if b["kind"] == "region"}
+    for fg in figs:
+        rb = regmap.get(id(fg))
+        cap = fg["caption"]
+        out.append({"id": "%s-%s" % ("figure" if fg["kind"] == "figure" else fg["kind"], fg["number"]),
+                    "kind": fg["kind"], "label": cap["text"].split()[0] + " " + fg["number"], "number": fg["number"],
+                    "page": fg["page"], "block": rb["id"] if rb else None,
+                    "bbox": [round(fg["x0"], 1), round(fg["y0"], 1), round(fg["x1"], 1), round(fg["y1"], 1)],
+                    "caption": {"text": cap["text"], "bbox": _bb(cap)},
+                    "text_inside": [s["text"] for s in fg.get("text_inside", [])][:80],
+                    "notes": fg.get("notes", [])})
+    return out
+
+
+def _metadata(blocks):
+    meta = {"title": None, "title_block": None, "front_matter": [], "abstract": None, "abstract_blocks": [],
+            "keywords": None}
+    for b in blocks:
+        t = b.get("type")
+        if t == "title" and not meta["title"]:
+            meta["title"], meta["title_block"] = b["text"], b["id"]
+        elif t == "front_matter":
+            meta["front_matter"].append({"block": b["id"], "text": b["text"]})
+        elif t == "abstract":
+            txt = b["text"]
+            if b.get("runin_label"):
+                txt = ABSTRACT_RUNIN_RE.sub("", txt, count=1)
+            meta["abstract"] = (meta["abstract"] + " " + txt) if meta["abstract"] else txt
+            meta["abstract_blocks"].append(b["id"])
+            if b.get("inferred"):
+                meta["abstract_inferred"] = True
+        elif t == "keywords" and not meta["keywords"]:
+            meta["keywords"] = b["text"]
+    return meta
+
+
+def _public_block(b):
+    o = {"id": b["id"], "page": b["page"], "type": b.get("type"), "order": b["order"],
+         "bbox": _bb(b), "col": b["col"], "section": b.get("section")}
+    if b["kind"] == "region":
+        o["ref"] = ("table-" if b["region"] == "table" else "figure-") + str(b["obj"]["number"])
+        o["text"] = b["obj"]["caption"]["text"]
+        return o
+    o["text"] = b["text"]
+    if b["rich"] != b["text"]:
+        o["text_rich"] = b["rich"]
+    o["size"] = b["size"]
+    if b.get("bold"):
+        o["bold"] = True
+    for k in ("level", "number", "title", "continues", "continued_by", "caption_kind", "caption_number",
+              "eq_numbers", "inferred", "runin_label", "ocr_conf", "lead"):
+        if b.get(k) not in (None, [], ""):
+            o[k] = b[k]
+    o["lines"] = [{"text": ln["plain"], "bbox": _bb(ln)} for ln in b["lines"]]
+    return o

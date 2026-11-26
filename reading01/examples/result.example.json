@@ -1,0 +1,408 @@
+{
+ "_note": "示例输出（节选、已截断）：由 examples/case.example.json 在本地运行得到，仅用于说明接口，不是正式案例结果",
+ "case_id": "mock-bert-01",
+ "status": "success",
+ "status_reason": "全文已解析；表 2 已按单元格还原；问题已用表 2 的数据回答。",
+ "sections": [
+  {
+   "id": "sec-1",
+   "level": 1,
+   "number": null,
+   "title": "Abstract",
+   "page": 1,
+   "block": "p1-b4",
+   "parent": null
+  },
+  {
+   "id": "sec-2",
+   "level": 1,
+   "number": "1",
+   "title": "Introduction",
+   "page": 1,
+   "block": "p1-b7",
+   "parent": null
+  },
+  {
+   "id": "sec-3",
+   "level": 1,
+   "number": "2",
+   "title": "Related Work",
+   "page": 2,
+   "block": "p2-b4",
+   "parent": null
+  },
+  "... (30 more)"
+ ],
+ "tables": [
+  {
+   "id": "table-1",
+   "label": "Table 1",
+   "caption": "Table 1: GLUE Test results, scored by the evaluation server (https://gluebenchmark.com/leaderboard). The number below each task denotes the number of training examples. The “Average” column is slightl...",
+   "page": 6,
+   "bbox": [
+    75.3,
+    68.2,
+    522.3,
+    "... (1 more)"
+   ],
+   "nrows": 7,
+   "ncols": 10,
+   "header_rows": 2,
+   "header": [
+    "System",
+    "MNLI-(m/mm) / 392k",
+    "QQP / 363k",
+    "... (7 more)"
+   ],
+   "rows": [
+    [
+     "Pre-OpenAI SOTA",
+     "80.6/80.1",
+     "66.1",
+     "... (7 more)"
+    ],
+    [
+     "BiLSTM+ELMo+Attn",
+     "76.4/76.1",
+     "64.8",
+     "... (7 more)"
+    ],
+    [
+     "OpenAI GPT",
+     "82.1/81.4",
+     "70.3",
+     "... (7 more)"
+    ],
+    "... (2 more)"
+   ],
+   "csv": "tables/table-1.csv",
+   "html": "tables/table-1.html",
+   "crop": "crops/table-1.png",
+   "issues": [
+    "row 1: 9 of 10 columns filled (empty cells or wrapped text)"
+   ],
+   "image_only": false
+  },
+  {
+   "id": "table-2",
+   "label": "Table 2",
+   "caption": "Table 2: SQuAD 1.1 results. The BERT ensemble is 7x systems which use different pre-training check- points and fine-tuning seeds.",
+   "page": 7,
+   "bbox": [
+    82.9,
+    66.9,
+    279.4,
+    "... (1 more)"
+   ],
+   "nrows": 15,
+   "ncols": 5,
+   "header_rows": 2,
+   "header": [
+    "System",
+    "Dev / EM",
+    "Dev / F1",
+    "... (2 more)"
+   ],
+   "rows": [
+    [
+     "Top Leaderboard Systems (Dec 10th, 2018)",
+     "",
+     "",
+     "... (2 more)"
+    ],
+    [
+     "Human",
+     "-",
+     "-",
+     "... (2 more)"
+    ],
+    [
+     "#1 Ensemble - nlnet",
+     "-",
+     "-",
+     "... (2 more)"
+    ],
+    "... (10 more)"
+   ],
+   "csv": "tables/table-2.csv",
+   "html": "tables/table-2.html",
+   "crop": "crops/table-2.png",
+   "issues": [
+    "row 1: 4 of 5 columns filled (empty cells or wrapped text)"
+   ],
+   "image_only": false
+  },
+  {
+   "id": "table-4",
+   "label": "Table 4",
+   "caption": "Table 4: SWAG Dev and Test accuracies. †Human per- formance is measured with 100 samples, as reported in the SWAG paper.",
+   "page": 7,
+   "bbox": [
+    349.7,
+    66.9,
+    480.8,
+    "... (1 more)"
+   ],
+   "nrows": 8,
+   "ncols": 3,
+   "header_rows": 1,
+   "header": [
+    "System",
+    "Dev",
+    "Test"
+   ],
+   "rows": [
+    [
+     "ESIM+GloVe",
+     "51.9",
+     "52.7"
+    ],
+    [
+     "ESIM+ELMo",
+     "59.1",
+     "59.2"
+    ],
+    [
+     "OpenAI GPT",
+     "-",
+     "78.0"
+    ],
+    "... (4 more)"
+   ],
+   "csv": "tables/table-4.csv",
+   "html": "tables/table-4.html",
+   "crop": "crops/table-4.png",
+   "issues": [
+    "text rows on both sides of the caption; chose the upper side by layout convention"
+   ],
+   "image_only": false
+  },
+  "... (5 more)"
+ ],
+ "answers": [
+  {
+   "question": "BERT-LARGE (Single) 在 SQuAD 1.1 开发集上的 F1 是多少？",
+   "answer": "90.9（同一行 Dev EM 为 84.1）",
+   "evidence": [
+    {
+     "block": "table-2",
+     "quote": "84.1 90.9",
+     "file": "paper.pdf",
+     "page": 7,
+     "bbox": [
+      82.9,
+      66.9,
+      279.4,
+      "... (1 more)"
+     ],
+     "block_type": "table",
+     "quote_check": {
+      "verified": true,
+      "how": "found in p7-b0 (cited table-2)",
+      "file": "paper.pdf",
+      "page": 7,
+      "block": "p7-b0",
+      "bbox": [
+       82.9,
+       192.9,
+       279.4,
+       "... (1 more)"
+      ]
+     }
+    }
+   ],
+   "confidence": "high"
+  }
+ ],
+ "evidence": [
+  {
+   "block": "table-2",
+   "quote": "84.1 90.9",
+   "file": "paper.pdf",
+   "page": 7,
+   "bbox": [
+    82.9,
+    66.9,
+    279.4,
+    "... (1 more)"
+   ],
+   "block_type": "table",
+   "quote_check": {
+    "verified": true,
+    "how": "found in p7-b0 (cited table-2)",
+    "file": "paper.pdf",
+    "page": 7,
+    "block": "p7-b0",
+    "bbox": [
+     82.9,
+     192.9,
+     279.4,
+     "... (1 more)"
+    ]
+   }
+  }
+ ],
+ "uncertainties": [
+  {
+   "file": "paper.pdf",
+   "issue": "QA check 'paragraphs ending mid-sentence without a detected continuation' -> 5",
+   "detail": {
+    "blocks": [
+     {
+      "block": "p7-b8",
+      "page": 7,
+      "ends_with": "j. We predict a non-null ˆ answer when ˆ"
+     },
+     {
+      "block": "p12-b19",
+      "page": 12,
+      "ends_with": " procedure can be further illustrated by"
+     },
+     {
+      "block": "p12-b20",
+      "page": 12,
+      "ends_with": "he [MASK] token, e.g., my dog is hairy →"
+     },
+     "... (2 more)"
+    ],
+    "note": "usually text before a display equation, a float, or a reading-order problem"
+   }
+  },
+  {
+   "issue": "表 2 的 Test 列对单模型为 “-”，即原文未报告单模型测试集成绩。"
+  }
+ ],
+ "materials": [
+  {
+   "file": "/input/paper.pdf",
+   "sha256": "5692a5514787a8c6727b4ff3b726a3385798bc68e12138d1d4af83947e2acf6e",
+   "pages_total": 16,
+   "pages_parsed": [
+    1,
+    2,
+    3,
+    "... (13 more)"
+   ],
+   "backend": "pymupdf",
+   "document_json": "/app/output/parsed/document.json",
+   "document_md": "/app/output/parsed/document.md",
+   "parse_report": "/app/output/parsed/parse_report.md",
+   "tables_dir": "/app/output/parsed/tables",
+   "previews": [
+    "previews/page-001.png",
+    "previews/page-002.png",
+    "previews/page-003.png"
+   ],
+   "qa_status": "success_with_warnings",
+   "token_recall_vs_independent_extractor": 0.9967
+  }
+ ],
+ "structure_summary": [
+  {
+   "file": "paper.pdf",
+   "title": "BERT: Pre-training of Deep Bidirectional Transformers for Language Understanding",
+   "sections": 33,
+   "tables": 8,
+   "figures": 5,
+   "equations": 0,
+   "footnotes": 18,
+   "references": 58,
+   "columns_per_page": [
+    2
+   ]
+  }
+ ],
+ "not_reported": [
+  {
+   "item": "BERT-LARGE (Single) 的 SQuAD 1.1 测试集 F1（表中为 “-”）"
+  }
+ ],
+ "manual_takeover": [],
+ "change_records": [
+  {
+   "file": "paper.pdf",
+   "page_furniture_removed": 1,
+   "furniture_examples": [
+    "2019 May 24 [cs.CL] arXiv:1810.04805v2"
+   ],
+   "dehyphenated_line_breaks": 315,
+   "dehyphenation_examples": [
+    {
+     "block": "p1-b5",
+     "from": "representa-|tion",
+     "to": "representation",
+     "rule": "removed hyphen (form seen in document)"
+    },
+    {
+     "block": "p1-b5",
+     "from": "repre-|sentation",
+     "to": "representation",
+     "rule": "removed hyphen (form seen in document)"
+    },
+    {
+     "block": "p1-b5",
+     "from": "Rad-|ford",
+     "to": "Radford",
+     "rule": "removed hyphen (form seen in document)"
+    },
+    "... (2 more)"
+   ],
+   "paragraphs_joined_across_columns_or_pages": [
+    {
+     "from": "p1-b11",
+     "to": "p2-b0",
+     "reason": "paragraph runs across pages",
+     "join": "cabulary id of the masked ‖ word based only on its co"
+    },
+    {
+     "from": "p2-b12",
+     "to": "p3-b1",
+     "reason": "paragraph runs across pages",
+     "join": "-to-right language model- ‖ ing and auto-encoder obje"
+    },
+    {
+     "from": "p3-b6",
+     "to": "p3-b7",
+     "reason": "paragraph runs across columns",
+     "join": "ent tasks. There is mini- ‖ mal difference between th"
+    },
+    "... (12 more)"
+   ],
+   "ligatures_expanded": 157,
+   "ocr_numeric_corrections": [],
+   "note": "original line text and coordinates are kept in document.json blocks[].lines"
+  }
+ ],
+ "contract": {
+  "source": {
+   "output_contract": {
+    "fields": [
+     "case_id",
+     "status",
+     "sections",
+     "... (4 more)"
+    ]
+   }
+  },
+  "fields": [
+   "case_id",
+   "status",
+   "sections",
+   "... (4 more)"
+  ],
+  "auto_filled": [
+   "case_id",
+   "status",
+   "sections",
+   "... (4 more)"
+  ],
+  "agent_filled": [],
+  "unfilled": []
+ },
+ "run": {
+  "tool": "weekly-skill pdfdoc",
+  "draft": false,
+  "finished_at": "2026-11-26T06:02:24+0000",
+  "case_json": "/input/case.json"
+ }
+}

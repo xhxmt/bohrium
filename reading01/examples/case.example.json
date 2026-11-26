@@ -1,0 +1,22 @@
+{
+ "case_id": "mock-bert-01",
+ "task": "Parse the paper. Report the section hierarchy and Table 2 as structured data, and answer: what Dev F1 does BERT-LARGE (Single) reach on SQuAD 1.1? Cite page and location.",
+ "materials": [
+  {
+   "kind": "pdf",
+   "path": "paper.pdf"
+  }
+ ],
+ "output_contract": {
+  "fields": [
+   "case_id",
+   "status",
+   "sections",
+   "tables",
+   "answers",
+   "evidence",
+   "uncertainties"
+  ]
+ },
+ "_note": "示例（示意输入），不是正式测试案例"
+}
