@@ -23,70 +23,62 @@ TYPE_COLORS = {
 # --------------------------------------------------------------------------
 
 def crop_region(pdf, page, bbox, dpi, out_png, pad=4.0):
-    x0, y0, x1, y1 = bbox[0] - pad, bbox[1] - pad, bbox[2] + pad, bbox[3] + pad
+    """Render a page region; with PyMuPDF the PDF is opened once and kept open (backends.open_cached)."""
+    return B.render_clip_png(pdf, page, bbox, dpi, out_png, pad=pad)
+
+
+def preview_pages(pdf, jobs, dpi=80):
+    """Render pages with numbered block boxes (reading order). jobs: [(page, boxes, out_png)].
+    Opens the PDF once for all pages (a separate handle: drawing must not touch the cached one)."""
+    done = []
     fitz = B._import_pymupdf()
     if fitz:
         try:
             doc = fitz.open(pdf)
             if getattr(doc, "needs_pass", False):
                 doc.authenticate("")
-            pg = doc[page - 1]
-            clip = fitz.Rect(max(0, x0), max(0, y0), min(pg.rect.width, x1), min(pg.rect.height, y1))
-            pg.get_pixmap(dpi=dpi, clip=clip).save(out_png)
-            doc.close()
-            return True
+            try:
+                for page, boxes, out_png in jobs:
+                    pg = doc[page - 1]
+                    for k, (bb, typ, label) in enumerate(boxes):
+                        col = tuple(c / 255.0 for c in TYPE_COLORS.get(typ, (0, 0, 0)))
+                        r = fitz.Rect(*bb)
+                        pg.draw_rect(r, color=col, width=0.8)
+                        pg.insert_text(fitz.Point(r.x0 + 1, r.y0 + 7), label, fontsize=7, color=col)
+                    pg.get_pixmap(dpi=dpi).save(out_png)
+                    done.append(out_png)
+            finally:
+                doc.close()
+            return done
         except Exception:
-            pass
-    if B._which("pdftoppm"):
-        s = dpi / 72.0
-        base = out_png[:-4]
-        res = subprocess.run(["pdftoppm", "-f", str(page), "-l", str(page), "-r", str(dpi), "-png", "-singlefile",
-                              "-x", str(int(max(0, x0) * s)), "-y", str(int(max(0, y0) * s)),
-                              "-W", str(int((x1 - x0) * s)), "-H", str(int((y1 - y0) * s)), pdf, base],
-                             capture_output=True, timeout=120)
-        return res.returncode == 0 and os.path.exists(out_png)
-    return False
-
-
-def preview_page(pdf, page, boxes, out_png, dpi=80):
-    """Render a page and draw numbered block boxes (reading order)."""
-    fitz = B._import_pymupdf()
-    if fitz:
-        try:
-            doc = fitz.open(pdf)
-            if getattr(doc, "needs_pass", False):
-                doc.authenticate("")
-            pg = doc[page - 1]
-            for k, (bb, typ, label) in enumerate(boxes):
-                col = tuple(c / 255.0 for c in TYPE_COLORS.get(typ, (0, 0, 0)))
-                r = fitz.Rect(*bb)
-                pg.draw_rect(r, color=col, width=0.8)
-                pg.insert_text(fitz.Point(r.x0 + 1, r.y0 + 7), label, fontsize=7, color=col)
-            pg.get_pixmap(dpi=dpi).save(out_png)
-            doc.close()
-            return True
-        except Exception:
-            pass
+            done = []
     try:
         from PIL import Image, ImageDraw  # type: ignore
     except Exception:
-        return False
-    tmp = out_png[:-4] + "_raw.png"
-    if not B.render_page_png(pdf, page, dpi, tmp):
-        return False
-    im = Image.open(tmp).convert("RGB")
-    dr = ImageDraw.Draw(im)
+        return done
     s = dpi / 72.0
-    for bb, typ, label in boxes:
-        col = TYPE_COLORS.get(typ, (0, 0, 0))
-        dr.rectangle([bb[0] * s, bb[1] * s, bb[2] * s, bb[3] * s], outline=col, width=1)
-        dr.text((bb[0] * s + 1, bb[1] * s), label, fill=col)
-    im.save(out_png)
-    try:
-        os.remove(tmp)
-    except OSError:
-        pass
-    return True
+    for page, boxes, out_png in jobs:
+        tmp = out_png[:-4] + "_raw.png"
+        if not B.render_page_png(pdf, page, dpi, tmp):
+            continue
+        im = Image.open(tmp).convert("RGB")
+        dr = ImageDraw.Draw(im)
+        for bb, typ, label in boxes:
+            col = TYPE_COLORS.get(typ, (0, 0, 0))
+            dr.rectangle([bb[0] * s, bb[1] * s, bb[2] * s, bb[3] * s], outline=col, width=1)
+            dr.text((bb[0] * s + 1, bb[1] * s), label, fill=col)
+        im.save(out_png)
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
+        done.append(out_png)
+    return done
+
+
+def preview_page(pdf, page, boxes, out_png, dpi=80):
+    """Single-page form of preview_pages (kept for callers of the old API)."""
+    return bool(preview_pages(pdf, [(page, boxes, out_png)], dpi))
 
 
 # --------------------------------------------------------------------------
@@ -196,6 +188,11 @@ def render_markdown(doc, rel_crops):
                 crop = rel_crops.get(tb["id"])
                 if crop:
                     out.append("![%s](%s)\n" % (tb["id"], crop))
+                if tb.get("continued_from"):
+                    out.append("<!-- %s continues %s -->" % (tb["id"], tb["continued_from"]))
+                if tb.get("merged"):
+                    out.append("<!-- %s spans pages: merged table (%s) in %s -->" % (
+                        tb["id"], " + ".join(tb["merged"]["parts"]), tb["merged"].get("csv") or "document.json"))
                 for iss in tb.get("issues", [])[:4]:
                     out.append("<!-- check: %s -->" % iss)
         elif t == "figure":
@@ -248,18 +245,43 @@ def _tokens(text):
     return [t for t in re.findall(r"[A-Za-z]{3,}|\d+(?:\.\d+)?|[一-鿿]", text)]
 
 
+def _runs(pages):
+    """Contiguous page runs: [1, 2, 3, 7, 9, 10] -> [(1, 3), (7, 7), (9, 10)]."""
+    ps = sorted(set(pages))
+    out = []
+    for p in ps:
+        if out and p == out[-1][1] + 1:
+            out[-1] = (out[-1][0], p)
+        else:
+            out.append((p, p))
+    return out
+
+
 def reference_text(pdf, pages, backend):
-    """Independent extraction used only for cross-checking completeness."""
+    """Independent extraction used only for cross-checking completeness (same pages as the parse)."""
     if backend != "poppler" and B._which("pdftotext"):
-        res = subprocess.run(["pdftotext", "-f", str(min(pages)), "-l", str(max(pages)), pdf, "-"],
-                             capture_output=True, timeout=180)
-        if res.returncode == 0:
-            return res.stdout.decode("utf-8", "replace"), "pdftotext"
+        parts, ok = [], True
+        for a, b in _runs(pages):
+            res = subprocess.run(["pdftotext", "-f", str(a), "-l", str(b), pdf, "-"], capture_output=True, timeout=180)
+            if res.returncode != 0:
+                ok = False
+                break
+            parts.append(res.stdout.decode("utf-8", "replace"))
+        if ok:
+            return "\n".join(parts), "pdftotext"
     fitz = B._import_pymupdf()
     if backend != "pymupdf" and fitz:
-        doc = fitz.open(pdf)
-        txt = "\n".join(doc[p - 1].get_text() for p in pages)
-        return txt, "pymupdf"
+        try:
+            doc = fitz.open(pdf)
+            if getattr(doc, "needs_pass", False):
+                doc.authenticate("")
+            try:
+                txt = "\n".join(doc[p - 1].get_text() for p in pages)
+            finally:
+                doc.close()
+            return txt, "pymupdf"
+        except Exception:
+            pass
     pp = B._import("pypdf")
     if pp and backend != "pypdf":
         r = pp.PdfReader(pdf)
@@ -394,10 +416,30 @@ def write_outputs(doc, pdf, outdir, previews=True, crops=True, max_preview_pages
                 fh.write("**%s** (page %d)\n\n%s\n" % (t["caption"]["text"], t["page"], t["markdown"]))
             t["csv"] = "tables/%s.csv" % t["id"]
             t["html_file"] = "tables/%s.html" % t["id"]
+        if t.get("merged"):
+            m = t["merged"]
+            base = t["id"] + "-merged"
+            with open(os.path.join(tdir, base + ".csv"), "w", newline="", encoding="utf-8") as fh:
+                w = csv.writer(fh)
+                if m["header_rows"]:
+                    w.writerow(t["header"])
+                for row in m["matrix"][m["header_rows"]:]:
+                    w.writerow(row)
+            with open(os.path.join(tdir, base + ".md"), "w", encoding="utf-8") as fh:
+                fh.write("**%s** (pages %s; merged from %s)\n\n%s\n" % (
+                    t["caption"]["text"], ", ".join(str(p) for p in sorted(set(
+                        [t["page"]] + [x["page"] for x in doc["tables"] if x["id"] in m["parts"]]))),
+                    ", ".join(m["parts"]), m["markdown"]))
+            m["csv"] = "tables/%s.csv" % base
     # crops
     if crops and is_pdf:
         os.makedirs(cdir, exist_ok=True)
-        jobs = [(t["id"], t["page"], t["bbox"] if not t.get("image_only") else t["caption"]["bbox"]) for t in doc["tables"]]
+        def tbox(t):
+            if t.get("image_bbox"):
+                c, i = t["caption"]["bbox"], t["image_bbox"]
+                return [min(c[0], i[0]), min(c[1], i[1]), max(c[2], i[2]), max(c[3], i[3])]
+            return t["bbox"] if not t.get("image_only") else t["caption"]["bbox"]
+        jobs = [(t["id"], t["page"], tbox(t)) for t in doc["tables"]]
         jobs += [(f["id"], f["page"], f["bbox"]) for f in doc["figures"][:40]]
         jobs += [(e["id"], e["page"], e["bbox"]) for e in doc["equations"][:60]]
         for k, (oid, page, bb) in enumerate(jobs):
@@ -417,12 +459,15 @@ def write_outputs(doc, pdf, outdir, previews=True, crops=True, max_preview_pages
             bypage.setdefault(b["page"], []).append(b)
         for f in doc["furniture"]:
             bypage.setdefault(f["page"], [])
+        pjobs = []
         for k, page in enumerate(sorted(bypage)[:max_preview_pages]):
             boxes = [(b["bbox"], b["type"], "%d" % i) for i, b in enumerate(bypage[page])]
             boxes += [(f["bbox"], "empty", "x") for f in doc["furniture"] if f["page"] == page]
-            outp = os.path.join(pdir, "page-%03d.png" % page)
-            if preview_page(pdf, page, boxes, outp):
-                prev_files.append("previews/page-%03d.png" % page)
+            pjobs.append((page, boxes, os.path.join(pdir, "page-%03d.png" % page)))
+        for outp in preview_pages(pdf, pjobs):
+            prev_files.append("previews/" + os.path.basename(outp))
+    if is_pdf:
+        B.close_cached(pdf)
     doc["previews"] = prev_files
     # QA
     doc["qa"] = qa_report(doc, pdf)

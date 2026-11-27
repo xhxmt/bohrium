@@ -47,8 +47,13 @@ def summary_text(doc, files, max_sections=60):
         L.append("  ... %d more" % (len(doc["sections"]) - max_sections))
     L.append("tables (%d):" % len(doc["tables"]))
     for t in doc["tables"]:
+        flags = ("IMAGE? " if t.get("image_only") else "") + ("OCR-read " if t.get("body_source") else "") + \
+            ("continues %s " % t["continued_from"] if t.get("continued_from") else "") + \
+            ("merged %s " % "+".join(t["merged"]["parts"]) if t.get("merged") else "") + \
+            ("%d repairs " % len([i for i in t.get("issues", []) if i.startswith("repaired")]) if any(
+                i.startswith("repaired") for i in t.get("issues", [])) else "")
         L.append("  %s p%d %dx%d hdr=%d %s| %s" % (t["id"], t["page"], t["nrows"], t["ncols"], t["header_rows"],
-                                                  "IMAGE? " if t.get("image_only") else "", t["caption"]["text"][:90]))
+                                                  flags, t["caption"]["text"][:90] or t["label"]))
     L.append("figures (%d): %s" % (len(doc["figures"]), ", ".join("%s p%d" % (f["id"], f["page"]) for f in doc["figures"][:30])))
     nums = [e["number"] for e in doc["equations"] if e.get("number")]
     L.append("equations: %d display (%d numbered: %s)" % (len(doc["equations"]), len(nums), " ".join(nums[:30])))

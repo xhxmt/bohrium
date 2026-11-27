@@ -9,7 +9,15 @@ MATH_FONT_RE = re.compile(r"(cmmi|cmsy|cmex|msbm|msam|eufm|rsfs|math|symbol|stix
                           r"mtmi|mtsy|txmi|txsy|pxmi|pxsy|lmmath|euler|esint|wasy)", re.I)
 MATH_CHARS = set("=+−-×÷·∑∏∫∮√∂∇≤≥≠≈≡∝∈∉⊂⊃⊆⊇∪∩∧∨→←↔⇒⇐⇔↦∞±∓‖∥⊥∠°′″^_|<>/*∗"
                  "αβγδεζηθϑικλμνξοπϖρϱσςτυφϕχψωΓΔΘΛΞΠΣΥΦΨΩℓℏℜℑ∀∃∅⊕⊗⊙†‡")
-PAGE_NUM_RE = re.compile(r"^(page\s*)?[-–—]?\s*(\d{1,4}|[ivxlcdm]{1,7})\s*[-–—]?(\s*(of|/)\s*\d{1,4})?$", re.I)
+PAGE_NUM_RE = re.compile(r"^(page\s*)?[-–—]?\s*(\d{1,4}|[ivxlcdm]{1,7})\s*[-–—]?(\s*(of|/)\s*\d{1,4})?$|"
+                         r"^第\s*\d{1,4}\s*页(\s*[/，,]?\s*共\s*\d{1,4}\s*页)?$|^\d{1,4}\s*/\s*\d{1,4}$", re.I)
+# one-off page furniture (journal line, DOI, arXiv id, copyright) that a short document cannot
+# confirm by repetition; only small-type lines inside the outer page margins qualify
+TOP_HINT_RE = re.compile(r"(arxiv:\s*\d|preprint|manuscript|proceedings|conference|journal|\bvol\.|volume\s+\d|"
+                         r"issn|doi\s*[:.]|https?://|www\.|©|copyright|licen[cs]e|accepted|submitted|published|"
+                         r"学报|期刊|杂志|第\s*\d+\s*卷|第\s*\d+\s*期|\d{4}\s*年)", re.I)
+BOTTOM_HINT_RE = re.compile(r"(©|copyright|all rights reserved|preprint submitted|manuscript submitted|"
+                            r"accepted for publication|licen[cs]ed? under|issn|收稿日期|网络出版|版权)", re.I)
 
 
 def is_cjk(ch):
@@ -40,9 +48,27 @@ def rich_words(words):
     return out
 
 
+def cjk_join(a, b):
+    """Join two text pieces with a space, except between two CJK characters."""
+    if not a:
+        return b
+    if not b:
+        return a
+    if is_cjk(a[-1]) and is_cjk(b[0]):
+        return a + b
+    return a + " " + b
+
+
 def tlen(t):
     """Display length: a CJK character is about as wide as two Latin letters."""
     return len(t) + len(CJK_RE.findall(t))
+
+
+def word_count(t):
+    """Words for length thresholds: Latin words + CJK characters / 2 (Chinese has no spaces)."""
+    cjk = len(CJK_RE.findall(t or ""))
+    latin = len(re.findall(r"[A-Za-z0-9]+(?:[-'.][A-Za-z0-9]+)*", CJK_RE.sub(" ", t or "")))
+    return latin + cjk // 2
 
 
 def _median(xs, default=0.0):
@@ -185,6 +211,7 @@ def detect_furniture(pages):
     need = max(2, int(0.3 * n + 0.5)) if n >= 3 else 2
     rep_top = {k for k, v in top_keys.items() if len(v) >= need}
     rep_bot = {k for k, v in bot_keys.items() if len(v) >= need}
+    body = body_font_size(pages)
     removed = []
     for pg in pages:
         W, H = pg["width"], pg["height"]
@@ -217,10 +244,20 @@ def detect_furniture(pages):
                 s["role"] = "running_footer"
             elif (s["y1"] <= 0.075 * H or s["y0"] >= 0.925 * H) and PAGE_NUM_RE.match(s["text"].strip()):
                 s["role"] = "page_number"
+            elif s["y1"] <= 0.07 * H and s["size"] <= 0.95 * body and len(s["text"]) <= 160 and \
+                    TOP_HINT_RE.search(s["text"]):
+                s["role"] = "running_header"
+                s["furniture_rule"] = "top-margin journal/DOI/arXiv line (not repeated)"
+            elif s["y0"] >= 0.93 * H and s["size"] <= 0.95 * body and len(s["text"]) <= 200 and \
+                    BOTTOM_HINT_RE.search(s["text"]):
+                s["role"] = "running_footer"
+                s["furniture_rule"] = "bottom-margin copyright/licence line (not repeated)"
         for s in segs:
             if s["role"] in ("line_number", "margin_text", "running_header", "running_footer", "page_number"):
                 removed.append({"page": pg["page"], "role": s["role"], "text": s["text"],
                                 "bbox": _bb(s)})
+                if s.get("furniture_rule"):
+                    removed[-1]["rule"] = s["furniture_rule"]
     return removed
 
 
@@ -261,7 +298,12 @@ def _gutters_from_coverage(segs, lo, hi):
         return []
     n0 = int(lo)
     cov = [0] * (int(hi) - n0 + 2)
+    mid_page = (lo + hi) / 2.0
     for s in narrow:
+        # a short line centred on the page (author, affiliation, a centred title line) belongs to a
+        # full-width band and does not block the gutter; column text is never centred there
+        if abs((s["x0"] + s["x1"]) / 2.0 - mid_page) < 0.06 * bw and s["x0"] < mid_page < s["x1"]:
+            continue
         a = max(int(s["x0"]) - n0, 0)
         b = min(int(s["x1"]) - n0, len(cov) - 1)
         for i in range(a, b + 1):

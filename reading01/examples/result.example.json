@@ -1,5 +1,5 @@
 {
- "_note": "示例输出（节选、已截断）：由 examples/case.example.json 在本地运行得到，仅用于说明接口，不是正式案例结果",
+ "_note": "示例输出（节选、已截断）：由 examples/case.example.json 与 answers.example.json 在本地运行 run_case.py + finalize.py 得到，仅用于说明接口，不是正式案例结果",
  "case_id": "mock-bert-01",
  "status": "success",
  "status_reason": "全文已解析；表 2 已按单元格还原；问题已用表 2 的数据回答。",
@@ -31,19 +31,28 @@
    "block": "p2-b4",
    "parent": null
   },
-  "... (30 more)"
+  {
+   "id": "sec-4",
+   "level": 2,
+   "number": "2.1",
+   "title": "Unsupervised Feature-based Approaches",
+   "page": 2,
+   "block": "p2-b6",
+   "parent": "sec-3"
+  },
+  "... (29 more)"
  ],
  "tables": [
   {
    "id": "table-1",
    "label": "Table 1",
-   "caption": "Table 1: GLUE Test results, scored by the evaluation server (https://gluebenchmark.com/leaderboard). The number below each task denotes the number of training examples. The “Average” column is slightl...",
+   "caption": "Table 1: GLUE Test results, scored by the evaluation server (https://gluebenchmark.com/leaderboard). The number below each task denotes the number of training examples. The “Average” column is slightly different than the official GLUE score, since we exclude the problematic WNLI set.8 BERT and OpenAI GPT are single- model, single task. F1 scores are reported for QQP and MRPC, Spearman correlations ... (truncated)",
    "page": 6,
    "bbox": [
     75.3,
     68.2,
     522.3,
-    "... (1 more)"
+    150.1
    ],
    "nrows": 7,
    "ncols": 10,
@@ -92,7 +101,7 @@
     82.9,
     66.9,
     279.4,
-    "... (1 more)"
+    232.1
    ],
    "nrows": 15,
    "ncols": 5,
@@ -101,26 +110,30 @@
     "System",
     "Dev / EM",
     "Dev / F1",
-    "... (2 more)"
+    "Test / EM",
+    "Test / F1"
    ],
    "rows": [
     [
      "Top Leaderboard Systems (Dec 10th, 2018)",
      "",
      "",
-     "... (2 more)"
+     "",
+     ""
     ],
     [
      "Human",
      "-",
      "-",
-     "... (2 more)"
+     "82.3",
+     "91.2"
     ],
     [
      "#1 Ensemble - nlnet",
      "-",
      "-",
-     "... (2 more)"
+     "86.0",
+     "91.7"
     ],
     "... (10 more)"
    ],
@@ -131,53 +144,7 @@
     "row 1: 4 of 5 columns filled (empty cells or wrapped text)"
    ],
    "image_only": false
-  },
-  {
-   "id": "table-4",
-   "label": "Table 4",
-   "caption": "Table 4: SWAG Dev and Test accuracies. †Human per- formance is measured with 100 samples, as reported in the SWAG paper.",
-   "page": 7,
-   "bbox": [
-    349.7,
-    66.9,
-    480.8,
-    "... (1 more)"
-   ],
-   "nrows": 8,
-   "ncols": 3,
-   "header_rows": 1,
-   "header": [
-    "System",
-    "Dev",
-    "Test"
-   ],
-   "rows": [
-    [
-     "ESIM+GloVe",
-     "51.9",
-     "52.7"
-    ],
-    [
-     "ESIM+ELMo",
-     "59.1",
-     "59.2"
-    ],
-    [
-     "OpenAI GPT",
-     "-",
-     "78.0"
-    ],
-    "... (4 more)"
-   ],
-   "csv": "tables/table-4.csv",
-   "html": "tables/table-4.html",
-   "crop": "crops/table-4.png",
-   "issues": [
-    "text rows on both sides of the caption; chose the upper side by layout convention"
-   ],
-   "image_only": false
-  },
-  "... (5 more)"
+  }
  ],
  "answers": [
   {
@@ -185,7 +152,7 @@
    "answer": "90.9（同一行 Dev EM 为 84.1）",
    "evidence": [
     {
-     "block": "table-2",
+     "block": "p7-b0",
      "quote": "84.1 90.9",
      "file": "paper.pdf",
      "page": 7,
@@ -193,12 +160,14 @@
       82.9,
       66.9,
       279.4,
-      "... (1 more)"
+      232.1
      ],
      "block_type": "table",
+     "object": "table-2",
      "quote_check": {
       "verified": true,
-      "how": "found in p7-b0 (cited table-2)",
+      "match": "exact",
+      "how": "found in the cited block",
       "file": "paper.pdf",
       "page": 7,
       "block": "p7-b0",
@@ -206,8 +175,9 @@
        82.9,
        192.9,
        279.4,
-       "... (1 more)"
-      ]
+       202.2
+      ],
+      "object": "table-2"
      }
     }
    ],
@@ -216,7 +186,7 @@
  ],
  "evidence": [
   {
-   "block": "table-2",
+   "block": "p7-b0",
    "quote": "84.1 90.9",
    "file": "paper.pdf",
    "page": 7,
@@ -224,12 +194,14 @@
     82.9,
     66.9,
     279.4,
-    "... (1 more)"
+    232.1
    ],
    "block_type": "table",
+   "object": "table-2",
    "quote_check": {
     "verified": true,
-    "how": "found in p7-b0 (cited table-2)",
+    "match": "exact",
+    "how": "found in the cited block",
     "file": "paper.pdf",
     "page": 7,
     "block": "p7-b0",
@@ -237,8 +209,9 @@
      82.9,
      192.9,
      279.4,
-     "... (1 more)"
-    ]
+     202.2
+    ],
+    "object": "table-2"
    }
   }
  ],
@@ -272,52 +245,45 @@
    "issue": "表 2 的 Test 列对单模型为 “-”，即原文未报告单模型测试集成绩。"
   }
  ],
- "materials": [
-  {
-   "file": "/input/paper.pdf",
-   "sha256": "5692a5514787a8c6727b4ff3b726a3385798bc68e12138d1d4af83947e2acf6e",
-   "pages_total": 16,
-   "pages_parsed": [
-    1,
-    2,
-    3,
-    "... (13 more)"
-   ],
-   "backend": "pymupdf",
-   "document_json": "/app/output/parsed/document.json",
-   "document_md": "/app/output/parsed/document.md",
-   "parse_report": "/app/output/parsed/parse_report.md",
-   "tables_dir": "/app/output/parsed/tables",
-   "previews": [
-    "previews/page-001.png",
-    "previews/page-002.png",
-    "previews/page-003.png"
-   ],
-   "qa_status": "success_with_warnings",
-   "token_recall_vs_independent_extractor": 0.9967
-  }
- ],
- "structure_summary": [
-  {
-   "file": "paper.pdf",
-   "title": "BERT: Pre-training of Deep Bidirectional Transformers for Language Understanding",
-   "sections": 33,
-   "tables": 8,
-   "figures": 5,
-   "equations": 0,
-   "footnotes": 18,
-   "references": 58,
-   "columns_per_page": [
-    2
-   ]
-  }
- ],
+ "sources": {
+  "materials": [
+   {
+    "file": "paper.pdf",
+    "path": "/input/paper.pdf",
+    "sha256": "5692a5514787a8c6727b4ff3b726a3385798bc68e12138d1d4af83947e2acf6e",
+    "pages_total": 16,
+    "pages_parsed": [
+     1,
+     2,
+     3,
+     "... (13 more)"
+    ]
+   }
+  ],
+  "evidence": [
+   {
+    "file": "paper.pdf",
+    "page": 7,
+    "block": "p7-b0",
+    "object": "table-2",
+    "bbox": [
+     82.9,
+     66.9,
+     279.4,
+     232.1
+    ],
+    "quote": "84.1 90.9",
+    "verified": true,
+    "for": "BERT-LARGE (Single) 在 SQuAD 1.1 开发集上的 F1 是多少？"
+   }
+  ],
+  "locator_convention": "page = 1-based PDF page; bbox = [x0, y0, x1, y1] in PDF points, top-left origin; block ids index document.json blocks"
+ },
  "not_reported": [
   {
    "item": "BERT-LARGE (Single) 的 SQuAD 1.1 测试集 F1（表中为 “-”）"
   }
  ],
- "manual_takeover": [],
  "change_records": [
   {
    "file": "paper.pdf",
@@ -370,7 +336,49 @@
    ],
    "ligatures_expanded": 157,
    "ocr_numeric_corrections": [],
+   "table_cell_repairs": [],
    "note": "original line text and coordinates are kept in document.json blocks[].lines"
+  }
+ ],
+ "manual_takeover": [],
+ "materials": [
+  {
+   "file": "/input/paper.pdf",
+   "sha256": "5692a5514787a8c6727b4ff3b726a3385798bc68e12138d1d4af83947e2acf6e",
+   "pages_total": 16,
+   "pages_parsed": [
+    1,
+    2,
+    3,
+    "... (13 more)"
+   ],
+   "backend": "pymupdf",
+   "document_json": "/app/output/parsed/document.json",
+   "document_md": "/app/output/parsed/document.md",
+   "parse_report": "/app/output/parsed/parse_report.md",
+   "tables_dir": "/app/output/parsed/tables",
+   "previews": [
+    "previews/page-001.png",
+    "previews/page-002.png",
+    "previews/page-003.png"
+   ],
+   "qa_status": "success_with_warnings",
+   "token_recall_vs_independent_extractor": 0.9967
+  }
+ ],
+ "structure_summary": [
+  {
+   "file": "paper.pdf",
+   "title": "BERT: Pre-training of Deep Bidirectional Transformers for Language Understanding",
+   "sections": 33,
+   "tables": 8,
+   "figures": 5,
+   "equations": 0,
+   "footnotes": 18,
+   "references": 58,
+   "columns_per_page": [
+    2
+   ]
   }
  ],
  "contract": {
@@ -380,7 +388,10 @@
      "case_id",
      "status",
      "sections",
-     "... (4 more)"
+     "tables",
+     "answers",
+     "evidence",
+     "uncertainties"
     ]
    }
   },
@@ -388,21 +399,67 @@
    "case_id",
    "status",
    "sections",
-   "... (4 more)"
+   "tables",
+   "answers",
+   "evidence",
+   "uncertainties"
   ],
+  "soft_fields": [],
+  "files": [],
   "auto_filled": [
    "case_id",
    "status",
    "sections",
-   "... (4 more)"
+   "tables",
+   "answers",
+   "evidence",
+   "uncertainties"
   ],
   "agent_filled": [],
-  "unfilled": []
+  "unfilled": [],
+  "type_problems": [],
+  "fill_report": {
+   "case_id": {
+    "type_expected": null,
+    "source": "case id",
+    "type_got": "string"
+   },
+   "status": {
+    "type_expected": null,
+    "source": "run status",
+    "type_got": "string"
+   },
+   "sections": {
+    "type_expected": null,
+    "source": "auto: section tree",
+    "type_got": "array"
+   },
+   "tables": {
+    "type_expected": null,
+    "source": "auto: tables (cells)",
+    "type_got": "array"
+   },
+   "answers": {
+    "type_expected": null,
+    "source": "built-in section",
+    "type_got": "array"
+   },
+   "evidence": {
+    "type_expected": null,
+    "source": "auto: evidence of the answers",
+    "type_got": "array"
+   },
+   "uncertainties": {
+    "type_expected": null,
+    "source": "built-in section",
+    "type_got": "array"
+   }
+  }
  },
  "run": {
   "tool": "weekly-skill pdfdoc",
   "draft": false,
-  "finished_at": "2026-11-26T06:02:24+0000",
+  "finished_at": "2026-11-27T02:18:25+0000",
   "case_json": "/input/case.json"
  }
 }

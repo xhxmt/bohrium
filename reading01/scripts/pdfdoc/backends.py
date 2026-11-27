@@ -102,7 +102,6 @@ def detect_tools():
         except Exception:
             langs = []
     t["tesseract_langs"] = langs
-    t["mineru_token_present"] = bool(os.environ.get("MINERU_TOKEN", "").strip())
     _TOOLS_CACHE.update(t)
     return dict(t)
 
@@ -610,17 +609,70 @@ def extract_pypdf(path, pages, stats):
 # rendering (for OCR and previews)
 # --------------------------------------------------------------------------
 
-def render_page_png(path, pno, dpi, out_png):
-    """Render one page to PNG. Returns True on success."""
+_DOC_CACHE = {}
+
+
+def open_cached(path):
+    """A PyMuPDF document kept open for repeated rendering (crops, previews, OCR); None without PyMuPDF."""
     fitz = _import_pymupdf()
-    if fitz:
+    if not fitz:
+        return None
+    key = os.path.abspath(path)
+    d = _DOC_CACHE.get(key)
+    if d is None:
         try:
-            doc = fitz.open(path)
-            if getattr(doc, "needs_pass", False):
-                doc.authenticate("")
-            pix = doc[pno - 1].get_pixmap(dpi=dpi)
+            d = fitz.open(path)
+            if getattr(d, "needs_pass", False):
+                d.authenticate("")
+        except Exception:
+            return None
+        _DOC_CACHE[key] = d
+    return d
+
+
+def close_cached(path=None):
+    for key in ([os.path.abspath(path)] if path else list(_DOC_CACHE)):
+        d = _DOC_CACHE.pop(key, None)
+        if d is not None:
+            try:
+                d.close()
+            except Exception:
+                pass
+
+
+def render_clip_png(path, pno, bbox, dpi, out_png, pad=4.0):
+    """Render a page region (PDF points, top-left origin) to PNG. Returns True on success.
+    PyMuPDF: the cached document handle (no re-open per crop). Otherwise pdftoppm renders
+    just the region (about 0.07 s per crop; a full page costs ~10x more)."""
+    x0, y0, x1, y1 = bbox[0] - pad, bbox[1] - pad, bbox[2] + pad, bbox[3] + pad
+    d = open_cached(path)
+    if d is not None:
+        try:
+            fitz = _import_pymupdf()
+            pg = d[pno - 1]
+            clip = fitz.Rect(max(0, x0), max(0, y0), min(pg.rect.width, x1), min(pg.rect.height, y1))
+            pg.get_pixmap(dpi=dpi, clip=clip).save(out_png)
+            return True
+        except Exception:
+            pass
+    if _which("pdftoppm"):
+        s = dpi / 72.0
+        base = out_png[:-4]
+        res = subprocess.run(["pdftoppm", "-f", str(pno), "-l", str(pno), "-r", str(dpi), "-png", "-singlefile",
+                              "-x", str(int(max(0, x0) * s)), "-y", str(int(max(0, y0) * s)),
+                              "-W", str(int((x1 - x0) * s)), "-H", str(int((y1 - y0) * s)), path, base],
+                             capture_output=True, timeout=120)
+        return res.returncode == 0 and os.path.exists(out_png)
+    return False
+
+
+def render_page_png(path, pno, dpi, out_png, use_fitz=True):
+    """Render one page to PNG. Returns True on success."""
+    d = open_cached(path) if use_fitz else None
+    if d is not None:
+        try:
+            pix = d[pno - 1].get_pixmap(dpi=dpi)
             pix.save(out_png)
-            doc.close()
             return True
         except Exception:
             pass
@@ -682,7 +734,7 @@ def _preprocess_for_ocr(png_in, png_out):
     return png_out, notes
 
 
-def _tesseract_tsv(img, lang, psm=3, timeout=120):
+def _tesseract_tsv(img, lang, psm=3, timeout=120):  # noqa: D401
     cmd = ["tesseract", img, "stdout", "-l", lang, "--psm", str(psm), "tsv"]
     res = subprocess.run(cmd, capture_output=True, timeout=timeout)
     if res.returncode != 0:
@@ -727,9 +779,9 @@ def _ocr_cjk_punct(ws, stats):
         n += len(w["t"])
 
 
-def ocr_image_to_lines(img_path, scale, lang, stats):
+def ocr_image_to_lines(img_path, scale, lang, stats, psm=3):
     """Run tesseract on an image; return (lines, mean_conf, n_words, low_conf_words)."""
-    tsv = _tesseract_tsv(img_path, lang)
+    tsv = _tesseract_tsv(img_path, lang, psm=psm)
     rows = tsv.splitlines()
     groups = {}
     confs = []
@@ -816,6 +868,7 @@ def ocr_pages(path, pages, stats, workdir, lang="auto", dpi=300, budget_s=420, i
     os.makedirs(workdir, exist_ok=True)
     start = time.time()
     chosen = None
+    langs_used = []
     out = []
     for pno in pages:
         if time.time() - start > budget_s:
@@ -856,24 +909,37 @@ def ocr_pages(path, pages, stats, workdir, lang="auto", dpi=300, budget_s=420, i
                 W, H = 612.0, 792.0
         best = None
         tried = []
-        for lg in ([chosen] if chosen else cand):
+        # the language that fitted the previous page is tried first and kept while it fits
+        # (mean confidence >= 75); otherwise the other candidates are tried too, so a Chinese
+        # paper with an English cover page / abstract is not read with the English model only
+        order = ([chosen] + [c for c in cand if c != chosen]) if chosen else cand
+        for lg in order:
+            tstats = {}  # corrections of a language that is not kept must not reach the change log
             try:
-                lines, mean, n, low = ocr_image_to_lines(pre, pscale, lg, stats)
+                lines, mean, n, low = ocr_image_to_lines(pre, pscale, lg, tstats)
             except Exception as e:
                 report["notes"].append("page %d lang %s failed: %s" % (pno, lg, e))
                 continue
             tried.append((lg, round(mean, 1), n))
             score = mean * min(n, 400)
             if best is None or score > best[0]:
-                best = (score, lg, lines, mean, n, low)
+                best = (score, lg, lines, mean, n, low, tstats)
+            if chosen is not None and lg == chosen and mean >= 75:
+                break
             if chosen is None and lg == "eng" and mean >= 80:
                 break
         if best is None:
             report["skipped_pages"].append(pno)
             continue
-        _, lg, lines, mean, n, low = best
-        chosen = chosen or lg
-        report["lang"] = chosen
+        _, lg, lines, mean, n, low, tstats = best
+        for k, v in tstats.items():
+            if isinstance(v, list):
+                stats.setdefault(k, []).extend(v)
+            elif isinstance(v, (int, float)):
+                stats[k] = stats.get(k, 0) + v
+        chosen = lg
+        langs_used.append(lg)
+        report["lang"] = lg if len(set(langs_used)) == 1 else "per page: " + ", ".join(sorted(set(langs_used)))
         out.append({"page": pno, "width": W, "height": H, "lines": lines, "images": [[0, 0, W, H]],
                     "rules": [], "graphics": [], "source": "ocr-tesseract:" + lg,
                     "notes": pnotes + (["lang trials: %s" % tried] if len(tried) > 1 else [])})
@@ -885,64 +951,3 @@ def ocr_pages(path, pages, stats, workdir, lang="auto", dpi=300, budget_s=420, i
                                 "preprocess": pnotes})
     report["elapsed_s"] = round(time.time() - start, 1)
     return out, report
-
-
-# --------------------------------------------------------------------------
-# optional: MinerU cloud API (only if the *user* sets MINERU_TOKEN)
-# --------------------------------------------------------------------------
-
-def mineru_available():
-    return bool(os.environ.get("MINERU_TOKEN", "").strip())
-
-
-def mineru_markdown(path, workdir, timeout_s=600):
-    """Send the PDF to the MinerU precise API and return its Markdown.
-
-    Disabled unless the user exports MINERU_TOKEN.  The PDF leaves the
-    machine, so never enable this for confidential or evaluation material
-    without permission.  Returns (markdown or None, note)."""
-    import json
-    import urllib.request
-    import zipfile
-    import io
-    token = os.environ.get("MINERU_TOKEN", "").strip()
-    if not token:
-        return None, "MINERU_TOKEN not set"
-    base = "https://mineru.net/api/v4"
-
-    def api(method, p, body=None):
-        req = urllib.request.Request(base + p, method=method,
-                                     data=json.dumps(body).encode() if body else None,
-                                     headers={"Authorization": "Bearer " + token,
-                                              "Content-Type": "application/json"})
-        with urllib.request.urlopen(req, timeout=60) as r:
-            return json.loads(r.read())
-    try:
-        name = os.path.basename(path)
-        b = api("POST", "/file-urls/batch", {"files": [{"name": name, "is_ocr": True, "data_id": "x"}],
-                                              "enable_formula": True, "enable_table": True})
-        put_url = b["data"]["file_urls"][0]
-        batch = b["data"]["batch_id"]
-        with open(path, "rb") as fh:
-            req = urllib.request.Request(put_url, data=fh.read(), method="PUT")
-            urllib.request.urlopen(req, timeout=120).read()
-        t0 = time.time()
-        while time.time() - t0 < timeout_s:
-            time.sleep(8)
-            st = api("GET", "/extract-results/batch/%s" % batch)
-            item = st["data"]["extract_result"][0] if "extract_result" in st["data"] else st["data"]["list"][0]
-            if item.get("state") == "done":
-                with urllib.request.urlopen(item["full_zip_url"], timeout=120) as r:
-                    z = zipfile.ZipFile(io.BytesIO(r.read()))
-                for n in z.namelist():
-                    if n.endswith("full.md"):
-                        md = z.read(n).decode("utf-8", "replace")
-                        with open(os.path.join(workdir, "mineru_full.md"), "w", encoding="utf-8") as fh:
-                            fh.write(md)
-                        return md, "ok"
-                return None, "zip without full.md"
-            if item.get("state") == "failed":
-                return None, "MinerU failed: %s" % item.get("err_msg", "")
-        return None, "MinerU timeout"
-    except Exception as e:  # network errors etc.
-        return None, "MinerU error: %s" % e

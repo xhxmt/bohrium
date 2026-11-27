@@ -74,6 +74,16 @@ def build(lang="zh"):
             "Wang L, Chen Y. Ion transport in crosslinked membranes. Macromolecules, 2019, 52: 2345-2356.",
             "Smith J, et al. Glass transition in polymer electrolytes. J Polym Sci, 2018, 56: 77-89.",
             "刘五. 膜材料力学性能测试方法. 北京: 化学工业出版社, 2017."]
+    if lang == "en":
+        # the English PDF uses a Latin-only font: every string in it (and in gt.json) must be English
+        table = {
+            "number": "1", "caption": "Properties of samples with different crosslinking degree",
+            "header": [["Sample", "Conductivity/(mS·cm⁻¹)", "", "Mechanical properties", ""],
+                       ["", "25 °C", "60 °C", "Strength/MPa", "Elongation/%"]],
+            "rows": table["rows"]}
+        refs = ["Zhang S, Li S. Advances in polymer electrolytes. Acta Polymerica Sinica, 2020, 51(3): 1-10.",
+                refs[1], refs[2],
+                "Liu W. Test Methods for Mechanical Properties of Membranes. Beijing: Chemical Industry Press, 2017."]
     return body, table, refs
 
 
@@ -101,9 +111,10 @@ def tex(body, table, refs, lang="zh"):
             h1, h2 = table["header"]
             L += [r"\begin{table}[t]", r"\centering\small", r"\caption{%s}" % table["caption"],
                   r"\begin{tabular}{lcccc}", r"\toprule",
-                  r"\multirow{2}{*}{%s} & \multicolumn{2}{c}{电导率/(mS$\cdot$cm$^{-1}$)} & \multicolumn{2}{c}{%s}\\" % (h1[0], h1[3]),
+                  r"\multirow{2}{*}{%s} & \multicolumn{2}{c}{%s} & \multicolumn{2}{c}{%s}\\" % (
+                      h1[0], h1[1].replace("·", r"$\cdot$").replace("cm⁻¹", r"cm$^{-1}$"), h1[3]),
                   r"\cmidrule(lr){2-3}\cmidrule(lr){4-5}",
-                  r" & 25 °C & 60 °C & 强度/MPa & 伸长率/\%\\", r"\midrule"]
+                  r" & %s\\" % " & ".join(x.replace("%", r"\%") for x in h2[1:]), r"\midrule"]
             for r in table["rows"]:
                 L.append(" & ".join(r) + r"\\")
             L += [r"\bottomrule", r"\end{tabular}", r"\end{table}"]
@@ -127,7 +138,6 @@ def main(out, lang="zh"):
                         r"结果表明适度交联可同时提高两类性能。",
                         r"\textbf{Abstract.} We vary the crosslink density and measure conductivity and mechanical "
                         r"properties of polymer electrolyte membranes; moderate crosslinking improves both."))
-        src = src.replace(table["caption"], "Properties of samples with different crosslinking degree")
     with open(os.path.join(out, name + ".tex"), "w", encoding="utf-8") as fh:
         fh.write(src)
     for _ in range(2):

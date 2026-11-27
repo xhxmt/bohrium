@@ -57,64 +57,114 @@ def main(argv=None):
     docs = []
     for p, files in zip(st["docs"], st["files"]):
         docs.append({"doc": json.load(open(p, encoding="utf-8")), "files": files})
+    if answers and not isinstance(answers, dict):
+        problems.append("answers.json must be a JSON object; finalized without it")
+        answers = {}
+    if "fields" in answers and not isinstance(answers["fields"], dict):
+        problems.append("answers.json 'fields' must be an object {contract field: value}; it was ignored")
+    if "answers" in answers and not isinstance(answers["answers"], (list, dict)):
+        problems.append("answers.json 'answers' must be a list of {question, answer, evidence}; it was ignored")
+        answers = dict(answers, answers=[])
+    meta = {}
     res = C.build_result(case, st["case_path"], st["case_id"], docs, st["failures"], answers=answers,
                          contract=st["contract"], fields=st["fields"], missing_materials=st["missing"],
-                         urls=st["urls"], draft=False)
-    if problems:
-        res.setdefault("uncertainties", []).extend({"issue": p} for p in problems)
+                         urls=st["urls"], draft=False, meta=meta, soft_fields=st.get("soft_fields"),
+                         extra_uncertainties=problems)
     # validation
-    report = []
+    report, review = [], []
     for f in st["fields"] or []:
         if f not in res:
             report.append("MISSING contract field: %s" % f)
         elif res[f] is None:
             report.append("EMPTY contract field: %s (fill it in answers.json 'fields' or explain in uncertainties)" % f)
-    nq = sum(1 for x in res["answers"] for e in x.get("evidence", []) if e.get("quote"))
-    bad = [e for x in res["answers"] for e in x.get("evidence", []) if e.get("quote_check") and not e["quote_check"]["verified"]]
-    noev = [x.get("question", x.get("id")) for x in res["answers"] if not x.get("evidence")]
+    for tp in meta.get("type_problems", []):
+        report.append("TYPE of contract field %s is %s but the contract asks for %s: fix it in answers.json 'fields'" % (
+            tp["field"], tp["got"], tp["expected"]))
+    for f in (st["fields"] or []) + (st.get("soft_fields") or []):
+        r = meta.get("report", {}).get(f, {})
+        if (r.get("source") or "").startswith("auto"):
+            review.append("%s <- %s (%s)" % (f, r["source"][6:], r.get("type_got")))
+    outdir = os.path.dirname(out)
+    inputs = {os.path.basename(m) for m in st.get("materials", [])}
+    for fn in st.get("contract_files") or C.contract_files(st["contract"]):
+        if os.path.basename(fn) in inputs:
+            continue  # an input file mentioned in the contract, not an output to produce
+        if not os.path.exists(os.path.join(outdir, fn)) and not os.path.exists(os.path.join(outdir, os.path.basename(fn))):
+            report.append("CONTRACT FILE missing: %s/%s (copy/convert it from %s/parsed/ or explain why not)" % (
+                outdir, fn, outdir))
+    ans = meta.get("answers", [])
+    nq = sum(1 for x in ans for e in x.get("evidence", []) if e.get("quote"))
+    bad = [e for x in ans for e in x.get("evidence", []) if e.get("quote_check") and not e["quote_check"]["verified"]]
+    loose = [e for x in ans for e in x.get("evidence", []) if (e.get("quote_check") or {}).get("match") in ("loose", "ellipsis")]
+    noev = [x.get("question", x.get("id")) for x in ans if not x.get("evidence")]
+    unres = [e.get("block") for x in ans for e in x.get("evidence", []) if e.get("resolved") is False]
     if bad:
         report.append("%d of %d quotes NOT found in the PDF text: fix the quote (copy it from query.py show) "
                       "or mark the answer uncertain" % (len(bad), nq))
+        for e in bad[:5]:
+            report.append("  not found: \"%s\" (cited %s)" % (e["quote"][:120], e.get("block")))
+    if unres:
+        report.append("evidence block ids not found in document.json: %s" % unres[:10])
     if noev:
         report.append("answers without evidence: %s" % noev[:10])
     with open(out, "w", encoding="utf-8") as fh:
         json.dump(res, fh, ensure_ascii=False, indent=1)
+    full = res
+    if meta.get("details"):
+        with open(os.path.join(os.path.dirname(out), "result_details.json"), "w", encoding="utf-8") as fh:
+            json.dump(meta["details"], fh, ensure_ascii=False, indent=1)
+        full = dict(meta["details"], **res)
+        print("contract forbids extra keys: built-in sections written to result_details.json")
     md = os.path.join(os.path.dirname(out), "result_summary.md")
     with open(md, "w", encoding="utf-8") as fh:
-        fh.write(summary_md(res))
-    print("result.json -> %s | status=%s | answers=%d | quotes verified %d/%d" % (
-        out, res["status"], len(res["answers"]), nq - len(bad), nq))
+        fh.write(summary_md(full))
+    print("result.json -> %s | status=%s | answers=%d | quotes verified %d/%d%s" % (
+        out, res["status"], len(ans), nq - len(bad), nq,
+        (" (%d matched ignoring spacing/punctuation or around '...')" % len(loose)) if loose else ""))
     for r in report + problems:
         print("CHECK: " + r)
+    if review:
+        print("REVIEW (filled automatically from the parse; confirm they answer what the contract asks): " +
+              "; ".join(review))
     if not report:
-        print("validation OK: all contract fields present%s" % ("" if not st["fields"] else " (%d)" % len(st["fields"])))
+        print("validation OK: all %d contract fields present with the declared types" % len(st["fields"] or [])
+              if st["fields"] else "validation OK (no output_contract in case.json; default result.json layout)")
     return 0
 
 
 def summary_md(res):
     L = ["# Result summary — case %s" % res["case_id"], "",
          "- status: **%s** — %s" % (res["status"], res["status_reason"]), ""]
-    for s in res.get("structure_summary", []):
+    for s in res.get("structure_summary", []) if isinstance(res.get("structure_summary"), list) else []:
         L.append("- %s: title “%s”; %d sections, %d tables, %d figures, %d equations, %d references; columns/page %s" % (
             s["file"], s["title"], s["sections"], s["tables"], s["figures"], s["equations"], s["references"],
             s["columns_per_page"]))
-    for m in res.get("materials", []):
+    for m in res.get("materials", []) if isinstance(res.get("materials"), list) else []:
         L.append("- outputs: %s, %s, %s" % (m.get("document_md"), m.get("document_json"), m.get("parse_report")))
-    if res.get("answers"):
+    ans = (res.get("skill_details") or {}).get("answers") or res.get("answers")
+    if ans and isinstance(ans, list):
         L += ["", "## Answers", ""]
-        for x in res["answers"]:
+        for x in ans:
+            if not isinstance(x, dict):
+                L.append("- %s" % x)
+                continue
             L.append("- **%s** — %s" % (x.get("question", x.get("id", "")), x.get("answer")))
-            for e in x.get("evidence", []):
-                ok = e.get("quote_check", {}).get("verified")
+            for e in (x.get("evidence") if isinstance(x.get("evidence"), list) else []):
+                if not isinstance(e, dict):
+                    continue
+                ok = (e.get("quote_check") or {}).get("verified")
                 L.append("  - evidence %s p%s %s %s%s" % (e.get("block", ""), e.get("page", "?"), e.get("bbox", ""),
                                                           ("“%s”" % e["quote"][:160]) if e.get("quote") else "",
                                                           "" if ok is None else (" ✔ verified" if ok else " ✘ NOT verified")))
-    if res.get("uncertainties"):
-        L += ["", "## Uncertainties", ""] + ["- " + json.dumps(u, ensure_ascii=False)[:300] for u in res["uncertainties"][:40]]
-    if res.get("not_reported"):
-        L += ["", "## Not reported / not determinable", ""] + ["- " + json.dumps(u, ensure_ascii=False)[:300] for u in res["not_reported"]]
-    if res.get("manual_takeover"):
-        L += ["", "## Manual takeover points", ""] + ["- " + json.dumps(u, ensure_ascii=False) for u in res["manual_takeover"]]
+    for key, title in (("uncertainties", "Uncertainties"), ("not_reported", "Not reported / not determinable"),
+                       ("manual_takeover", "Manual takeover points")):
+        v = res.get(key)
+        if v is None or (key in (res.get("skill_details") or {})):
+            v = (res.get("skill_details") or {}).get(key, v)
+        if isinstance(v, list) and v:
+            L += ["", "## " + title, ""] + ["- " + json.dumps(u, ensure_ascii=False)[:300] for u in v[:40]]
+        elif v:
+            L += ["", "## " + title, "", "- " + json.dumps(v, ensure_ascii=False)[:1000]]
     return "\n".join(L) + "\n"
 
 

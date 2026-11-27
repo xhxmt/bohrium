@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Score PDF-to-text methods against the generated ground truth.
 
-  python3 score_bench.py out/bench_zh.pdf out/bench_zh.gt.json [--skill-scripts ../submission/scripts]
+  python3 score_bench.py out/bench_zh.pdf out/bench_zh.gt.json [--skill-scripts ../scripts]
 
 Methods: pdftotext (default), pdftotext -layout, PyMuPDF get_text() (if installed),
 and this skill (pdfdoc -> document.md body text + structured tables/sections).
@@ -101,7 +101,7 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("pdf")
     ap.add_argument("gt")
-    ap.add_argument("--skill-scripts", default=os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "submission", "scripts"))
+    ap.add_argument("--skill-scripts", default=os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "scripts"))
     ap.add_argument("--python", default=sys.executable)
     ap.add_argument("--backend", default="auto")
     a = ap.parse_args()

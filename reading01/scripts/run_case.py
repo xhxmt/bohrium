@@ -64,10 +64,14 @@ def main(argv=None):
     cid = C.case_id(case, case_path)
     ttxt = C.task_text(case, task_path)
     contract, fields = C.find_contract(case)
-    mats, missing, urls = C.find_materials(case, case_path)
+    soft = [] if fields else [f for f in C.fields_in_text(ttxt) if f not in ("case_id",)]
+    specs = C.contract_specs(contract)
+    cfiles = C.contract_files(contract)
+    mats, missing, urls, others = C.find_materials(case, case_path)
     for m in a.material:
-        if os.path.isfile(m) and m not in mats:
+        if os.path.isfile(m) and os.path.abspath(m) not in [os.path.abspath(x) for x in mats]:
             mats.append(m)
+            others = [o for o in others if os.path.abspath(o) != os.path.abspath(m)]
     pages, page_src = (a.pages, "--pages") if a.pages else C.page_hint(case, ttxt)
     if page_src and "suggestion" in (page_src or ""):
         notes.append("task text mentions pages %s; NOT applied automatically (re-run with --pages %s if the task is "
@@ -78,11 +82,23 @@ def main(argv=None):
     print("-" * 78)
     print("TASK:\n" + (ttxt.strip() or "(no task text found; read case.json directly)"))
     print("-" * 78)
-    print("OUTPUT CONTRACT fields: %s" % (fields or "(none declared -> use the default result.json layout)"))
+    print("OUTPUT CONTRACT fields: %s" % (fields or "(none declared in case.json -> default result.json layout)"))
     if contract:
-        cj = json.dumps(contract, ensure_ascii=False)
-        print("contract raw: " + (cj[:1500] + " ...") if len(cj) > 1500 else "contract raw: " + cj)
+        cj = json.dumps(contract, ensure_ascii=False, indent=1)
+        with open(os.path.join(a.work, "contract.json"), "w", encoding="utf-8") as fh:
+            fh.write(cj)
+        print("contract (full copy: %s):" % os.path.join(a.work, "contract.json"))
+        print(cj if len(cj) <= 12000 else cj[:12000] + "\n... [longer than 12000 chars: read %s]" % os.path.join(a.work, "contract.json"))
+        typed = ["%s: %s" % (k, v["type"]) for k, v in specs.items() if v.get("type")]
+        if typed:
+            print("contract field types: " + ", ".join(typed))
+    if cfiles:
+        print("CONTRACT FILES to produce under %s: %s" % (a.out, cfiles))
+    if soft:
+        print("fields mentioned in the task text (no output_contract in case.json): %s" % soft)
     print("MATERIALS: %s" % ([os.path.relpath(m) if not os.path.isabs(m) else m for m in mats] or "NONE"))
+    if others:
+        print("OTHER input files (not parsed: case.json names its materials; add with --material PATH if needed): %s" % others)
     for m in missing:
         print("MISSING material named in case.json: %s" % m["reference"])
     for u in urls:
@@ -117,17 +133,36 @@ def main(argv=None):
             failures.append({"file": m, "error": "parser crash: %r" % e, "advice": "see traceback in the run log"})
         print("-" * 78)
     state = {"case_path": os.path.abspath(case_path), "task_path": task_path, "case_id": cid, "contract": contract,
-             "fields": fields, "materials": mats, "missing": missing, "urls": urls, "failures": failures,
+             "fields": fields, "soft_fields": soft, "contract_files": cfiles, "materials": mats, "missing": missing, "urls": urls, "failures": failures,
              "docs": [d["doc"]["_json_path"] for d in docs], "files": [d["files"] for d in docs],
              "out": os.path.abspath(a.out), "pages": pages}
     with open(os.path.join(a.work, "pdfdoc_state.json"), "w", encoding="utf-8") as fh:
         json.dump(state, fh, ensure_ascii=False, indent=1)
+    meta = {}
     res = C.build_result(case, case_path, cid, docs, failures, answers=None, task_txt=ttxt, contract=contract,
-                         fields=fields, missing_materials=missing, urls=urls, draft=True)
+                         fields=fields, missing_materials=missing, urls=urls, draft=True, meta=meta, soft_fields=soft)
     with open(os.path.join(a.out, "result.json"), "w", encoding="utf-8") as fh:
         json.dump(res, fh, ensure_ascii=False, indent=1)
-    print("DRAFT result.json written: %s (status=%s). Contract fields auto-filled: %s; still unfilled: %s" % (
-        os.path.join(a.out, "result.json"), res["status"], res["contract"]["auto_filled"], res["contract"]["unfilled"]))
+    if meta.get("details"):
+        with open(os.path.join(a.out, "result_details.json"), "w", encoding="utf-8") as fh:
+            json.dump(meta["details"], fh, ensure_ascii=False, indent=1)
+        print("the contract forbids extra keys (additionalProperties: false): built-in sections (evidence, "
+              "uncertainties, change records, ...) are in %s" % os.path.join(a.out, "result_details.json"))
+    print("DRAFT result.json written: %s (status=%s)" % (os.path.join(a.out, "result.json"), res["status"]))
+    if fields or soft:
+        print("contract fields in the draft (verify each against the contract; put corrected values in answers.json 'fields'):")
+        for f in list(fields) + soft:
+            r = meta["report"].get(f, {})
+            src = r.get("source") or "UNFILLED -> you must fill it"
+            typ = r.get("type_got")
+            exp = r.get("type_expected")
+            print("  - %s: %s [%s%s]%s" % (f, src, typ, (" expected %s" % exp) if exp else "",
+                                           ("  note: " + r["note"]) if r.get("note") else ""))
+        print("  automatic values are generic parse results; task-specific fields (answers, findings, judgements) "
+              "must come from you.")
+    if len(docs) > 1:
+        print("MULTIPLE documents parsed: query.py searches all of them; use --doc <file name> to pick one "
+              "(python3 %s/query.py docs)." % HERE)
     print("elapsed %.1fs" % (time.time() - t0))
     print("NEXT: answer the task from %s/parsed (query.py search/show/table/page), write %s/answers.json, "
           "then run finalize.py." % (a.out, a.work))

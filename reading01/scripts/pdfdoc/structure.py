@@ -103,7 +103,9 @@ def parse_document(path, pages_spec=None, backend="auto", ocr="auto", ocr_lang="
         cover = img_area / max(pg["width"] * pg["height"], 1.0)
         status = "text"
         if nchar < 25:
-            status = "no_text_layer" if (cover > 0.3 or bk != "pymupdf") else "empty"
+            # vector-outlined text (glyphs drawn as paths) or a sparse scan also has no text layer
+            status = "no_text_layer" if (cover > 0.1 or bk != "pymupdf" or pg.get("graphics")
+                                         or len(pg.get("rules", [])) > 5) else "empty"
         elif bad > 0.15 * nchar:
             status = "garbled_text_layer"
         pinfo[pg["page"]] = {"page": pg["page"], "text_chars": nchar, "bad_chars": bad,
@@ -153,6 +155,7 @@ def parse_document(path, pages_spec=None, backend="auto", ocr="auto", ocr_lang="
     doc["engine"]["body_font_size"] = body
     # ---- regions + reading order
     all_tables, all_figures, ordered_pages = [], [], []
+    table_ocr = {"n": 0, "budget": max(60.0, ocr_budget_s)}
     side_votes, side_pref = Counter(), None
     gutter_splits = 0
     for pg in pages:
@@ -161,6 +164,12 @@ def parse_document(path, pages_spec=None, backend="auto", ocr="auto", ocr_lang="
         ci = colmap[pg["page"]]
         cols = L.column_intervals(ci)
         tabs, figs, caps = T.find_regions(pg, cols, ci, body, lead, prefer=side_pref)
+        for tb in tabs:
+            if tb.get("image_only") and tb.get("image_bbox") and not is_image and ocr != "off" \
+                    and table_ocr["n"] < 8 and time.time() - t0 < table_ocr["budget"]:
+                table_ocr["n"] += 1
+                note = _ocr_table_image(path, tb, os.path.join(workdir, "table_ocr"), ocr_lang, stats, body)
+                log("image table %s p%d: %s" % (tb["number"], tb["page"], note))
         if tabs:
             side_votes[pg.get("table_caption_side", "below")] += 1
             side_pref = side_votes.most_common(1)[0][0]
@@ -200,7 +209,7 @@ def parse_document(path, pages_spec=None, backend="auto", ocr="auto", ocr_lang="
     refs = _references(blocks, body)
     _continuations(blocks, changes)
     equations = _equations(blocks)
-    tables_out = _tables_out(all_tables, blocks)
+    tables_out = _tables_out(all_tables, blocks, {pg["page"]: pg["height"] for pg in pages}, changes)
     figures_out = _figures_out(all_figures, blocks)
     footnotes = [{"id": b["id"], "page": b["page"], "bbox": _bb(b), "text": b["text"]}
                  for b in blocks if b["type"] == "footnote"]
@@ -227,6 +236,71 @@ def parse_document(path, pages_spec=None, backend="auto", ocr="auto", ocr_lang="
     })
     doc["engine"]["elapsed_s"] = round(time.time() - t0, 2)
     return doc
+
+
+def _ocr_table_image(path, tb, workdir, lang, stats, body):
+    """OCR an image-only table (raster image next to its caption) into cells."""
+    tools = B.detect_tools()
+    if not tools.get("tesseract"):
+        tb["notes"].append("table body is an image; no OCR engine to read it")
+        return "no tesseract"
+    os.makedirs(workdir, exist_ok=True)
+    bb = tb["image_bbox"]
+    dpi = 300
+    png = os.path.join(workdir, "table_p%d_%d.png" % (tb["page"], int(bb[1])))
+    if not B.render_clip_png(path, tb["page"], bb, dpi, png, pad=0.0):
+        tb["notes"].append("table image could not be rendered for OCR")
+        return "render failed"
+    langs = tools.get("tesseract_langs") or []
+    if lang and lang != "auto":
+        lg = lang
+    elif "chi_sim" in langs and re.search(r"[\u4e00-\u9fff]", tb["caption"]["text"]):
+        lg = "chi_sim+eng"
+    else:
+        lg = "eng" if ("eng" in langs or not langs) else langs[0]
+    pre, _notes = B._preprocess_for_ocr(png, png[:-4] + "_pre.png")
+    scale = 72.0 / dpi
+    try:
+        from PIL import Image  # type: ignore
+        with Image.open(png) as a, Image.open(pre) as b:
+            scale *= float(a.size[0]) / b.size[0]
+    except Exception:
+        pass
+    try:
+        lines, mean, n, low = B.ocr_image_to_lines(pre, scale, lg, stats, psm=6)
+    except Exception as e:
+        tb["notes"].append("OCR of the table image failed: %s" % e)
+        return "ocr failed"
+    for ln in lines:
+        for w in ln["words"]:
+            w["x0"] += bb[0]
+            w["x1"] += bb[0]
+            w["y0"] += bb[1]
+            w["y1"] += bb[1]
+    sizes = sorted(w["size"] for ln in lines for w in ln["words"])
+    size = sizes[len(sizes) // 2] if sizes else body
+    rows = T.table_from_ocr_lines(lines, size)
+    if len(rows) < 2:
+        tb["notes"].append("OCR found no table rows in the image")
+        return "no rows"
+    keep = {k: tb.get(k) for k in ("x0", "y0", "x1", "y1")}
+    tb["rows_raw"] = rows
+    tb["x0"], tb["y0"], tb["x1"], tb["y1"] = bb
+    T.build_cells(tb, size, [])
+    if tb["ncols"] < 2:
+        for k in ("grid", "ncols", "nrows", "header_rows", "repairs", "rules_used", "issues"):
+            tb.pop(k, None)
+        tb.update(keep)
+        tb["notes"].append("OCR text of the table image did not form columns")
+        return "no columns"
+    tb["image_only"] = False
+    tb["body_source"] = "ocr-tesseract:" + lg
+    tb["ocr_mean_conf"] = round(mean, 1)
+    tb["issues"] = tb.get("issues", []) + ["table body read by OCR from an embedded image (mean confidence %.0f); "
+                                           "verify every value against the crop" % mean]
+    if low:
+        tb["issues"].append("%d low-confidence OCR words: %s" % (len(low), ", ".join(w["t"] for w in low[:8])))
+    return "OCR %dx%d, mean conf %.0f" % (tb["nrows"], tb["ncols"], mean)
 
 
 def _compact(nums):
@@ -446,8 +520,18 @@ def _form_blocks(ordered_pages, body, lead):
             gap = r["y0"] - prev["y1"]
             left, right = edges.get(r["col"], (r["x0"], r["x1"]))
             width = max(right - left, 1.0)
-            if r["col"] != prev["col"] or (r["col"] != -1 and r.get("band") != prev.get("band")):
+            if prev.get("col_joined_full_width"):
                 brk = True
+            elif r["col"] != prev["col"] or (r["col"] != -1 and r.get("band") != prev.get("band")):
+                brk = True
+                # last line of a full-width paragraph (abstract) that is short enough to fall
+                # inside one column: same left edge, normal leading, sentence still open
+                if prev["col"] == -1 and r["col"] != -1 and abs(r["x0"] - prev["x0"]) < 2.0 and \
+                        -1.0 <= gap <= lead + 0.4 * size and abs(r["size"] - prev["size"]) < 0.08 * size and \
+                        not prev["text"].rstrip().endswith(TERMINAL) and not r["headish"] and not r["mathy"] and \
+                        not prev["headish"] and cur["col"] == -1:
+                    brk = False
+                    r["col_joined_full_width"] = True
             elif prev["headish"] and r["headish"]:
                 numbered = bool(NUMBERED_HEAD_RE.match(r["text"].strip())) or KNOWN_HEAD_RE.match(r["text"].strip())
                 brk = numbered or abs(r["size"] - prev["size"]) > 0.08 * size or r["bold"] != prev["bold"] \
@@ -611,8 +695,8 @@ def _classify(blocks, body, pages_list):
                 big["rows"].extend(nb["rows"])
                 big["lines"].extend(nb["lines"])
                 big["segs"].extend(nb["segs"])
-                big["text"] += " " + nb["text"]
-                big["rich"] += " " + nb["rich"]
+                big["text"] = L.cjk_join(big["text"], nb["text"])
+                big["rich"] = L.cjk_join(big["rich"], nb["rich"])
                 big["x0"], big["y0"] = min(big["x0"], nb["x0"]), min(big["y0"], nb["y0"])
                 big["x1"], big["y1"] = max(big["x1"], nb["x1"]), max(big["y1"], nb["y1"])
                 nb["type"] = "merged"
@@ -626,7 +710,7 @@ def _classify(blocks, body, pages_list):
                     break
                 if ABSTRACT_RUNIN_RE.match(t):
                     break
-                if b["type"] == "paragraph" and len(t.split()) > 40:
+                if b["type"] == "paragraph" and L.word_count(t) > 40:
                     break
                 if b["type"] in ("paragraph", "heading", "equation") and len(t) < 400 and b["size"] <= big["size"]:
                     b["type"] = "front_matter"
@@ -653,7 +737,7 @@ def _classify(blocks, body, pages_list):
             break
     if not found_abs:
         cands = [b for b in blocks if b["page"] == 1 and b["kind"] == "text" and b["type"] in ("paragraph", "front_matter")
-                 and len(b["text"].split()) >= 50]
+                 and L.word_count(b["text"]) >= 50]
         if cands:
             b = cands[0]
             if b["col"] == -1 or b["order"] <= min(x["order"] for x in cands):
@@ -831,7 +915,7 @@ def _split_refs(region, body):
             if txt.endswith("-") and p[:1].islower():
                 txt = txt[:-1] + p
             elif txt:
-                txt += " " + p
+                txt = L.cjk_join(txt, p)
             else:
                 txt = p
         m = REF_START_RE.match(txt)
@@ -908,41 +992,133 @@ def _equations(blocks):
     return eqs
 
 
-def _tables_out(tabs, blocks):
+def _tables_out(tabs, blocks, page_h=None, changes=None):
+    """Output tables. Ids: table-N (captioned), table-N-partK (continuation on a later
+    page: same number, a 'continued' / 续表 caption, or an uncaptioned ruled table at the
+    top of the next page with the same columns), table-uK (no caption)."""
+    page_h = page_h or {}
     out = []
     regmap = {id(b["obj"]): b for b in blocks if b["kind"] == "region"}
     seen = Counter()
-    for tb in sorted(tabs, key=lambda t: (t["page"], t["y0"], t["x0"])):
-        seen[tb["number"]] += 1
+    tabs = sorted(tabs, key=lambda t: (t["page"], t["y0"], t["x0"]))
+    first_on, last_on = {}, {}
+    for tb in tabs:
+        first_on.setdefault(tb["page"], tb)
+        last_on[tb["page"]] = tb
+    roots = {}
+    unc = 0
+    for tb in tabs:
         rb = regmap.get(id(tb))
         cap = tb["caption"]
-        o = {"id": "table-%s%s" % (tb["number"], "" if seen[tb["number"]] == 1 else "-part%d" % seen[tb["number"]]),
-             "label": "Table " + tb["number"] if not cap["text"].startswith("表") else "表" + tb["number"],
-             "number": tb["number"], "page": tb["page"], "block": rb["id"] if rb else None,
+        num = tb["number"]
+        why = None
+        if num is None:
+            prev = last_on.get(tb["page"] - 1)
+            if prev is not None and prev.get("_out") and first_on[tb["page"]] is tb and \
+                    tb["y0"] < 0.35 * page_h.get(tb["page"], 792.0) and \
+                    prev.get("y1", 0) > 0.55 * page_h.get(prev["page"], 792.0) and \
+                    prev.get("ncols") == tb.get("ncols") and prev["_out"].get("number") is not None:
+                num = prev["_out"]["number"]
+                why = "no caption, at the top of the page after %s with the same %d columns" % (
+                    prev["_out"]["id"], tb.get("ncols", 0))
+        if num is None:
+            unc += 1
+            tid, label = "table-u%d" % unc, "Table (no caption, p.%d)" % tb["page"]
+        else:
+            seen[num] += 1
+            tid = "table-%s%s" % (num, "" if seen[num] == 1 else "-part%d" % seen[num])
+            label = cap.get("label") if cap.get("label") and not cap.get("synthetic") else None
+            if not label:
+                root = roots.get(num)
+                label = root["label"] if root else "Table " + str(num)
+            if label.startswith("续表"):
+                label = "表" + str(num)
+        o = {"id": tid, "label": label, "number": num, "page": tb["page"], "block": rb["id"] if rb else None,
              "bbox": [round(tb["x0"], 1), round(tb["y0"], 1), round(tb["x1"], 1), round(tb["y1"], 1)],
              "caption": {"text": cap["text"], "bbox": _bb(cap), "position": tb.get("caption_side")},
              "nrows": tb.get("nrows", 0), "ncols": tb.get("ncols", 0), "header_rows": tb.get("header_rows", 0),
              "grid": tb.get("grid", []), "issues": tb.get("issues", []) + tb.get("notes", []),
              "image_only": tb.get("image_only", False), "ruling_lines_used": tb.get("rules_used", False)}
-        if seen[tb["number"]] > 1:
-            o["continued_from"] = "table-%s" % tb["number"]
-            o["issues"].append("same table number seen earlier: treated as continuation (cross-page table)")
+        for k in ("uncaptioned", "body_source", "ocr_mean_conf", "image_bbox"):
+            if tb.get(k) is not None:
+                o[k] = tb[k]
+        if num is not None and seen[num] > 1:
+            root = roots[num]
+            o["continued_from"] = root["id"]
+            o["issues"].append("continuation of %s (%s)" % (root["id"], why or (
+                "caption marked as continued" if cap.get("continued") else "same table number seen earlier")))
+            root.setdefault("continued_in", []).append(tid)
+        elif num is not None:
+            roots[num] = o
         o["markdown"] = T.table_markdown(tb) if tb.get("grid") else ""
         o["html"] = T.table_html(tb) if tb.get("grid") else ""
         o["matrix"] = T.table_matrix(tb) if tb.get("grid") else []
         o["header"] = T.flat_header(tb) if tb.get("grid") else []
+        tb["_id"] = tid
+        tb["_out"] = o
+        if changes is not None:
+            for r in tb.get("repairs", []):
+                changes.setdefault("table_repairs", []).append({"table": tid, "page": tb["page"], "repair": r})
         out.append(o)
+    # one merged table for tables split across pages
+    byid = {o["id"]: o for o in out}
+    for o in out:
+        parts = [byid[p] for p in o.get("continued_in", []) if p in byid]
+        if not parts or not o.get("grid"):
+            continue
+        if any(p["ncols"] != o["ncols"] or not p.get("grid") for p in parts):
+            o["issues"].append("continued in %s with a different column count: not merged" % ", ".join(o["continued_in"]))
+            continue
+        pages = [o["page"]] + [p["page"] for p in parts]
+        if any(b - a not in (0, 1) for a, b in zip(pages, pages[1:])):
+            o["issues"].append("same number again in %s but not on the following page(s): not merged" %
+                               ", ".join(o["continued_in"]))
+            continue
+        hdr = o["matrix"][:o["header_rows"]]
+        rows = list(o["matrix"])
+        notes = []
+        for p in parts:
+            pm = p["matrix"]
+            k = 0
+            while k < len(pm) and k < len(hdr) and [x.strip() for x in pm[k]] == [x.strip() for x in hdr[k]]:
+                k += 1
+            if k:
+                notes.append("%s: repeated header row(s) dropped" % p["id"])
+            elif p["header_rows"]:
+                notes.append("%s: its first %d row(s) were read as header but differ from %s's header; kept as rows" % (
+                    p["id"], p["header_rows"], o["id"]))
+            rows += pm[k:]
+        o["merged"] = {"parts": [o["id"]] + [p["id"] for p in parts], "nrows": len(rows), "ncols": o["ncols"],
+                       "header_rows": o["header_rows"], "matrix": rows, "notes": notes,
+                       "markdown": _matrix_markdown(o["header"], rows[o["header_rows"]:])}
     return out
+
+
+def _matrix_markdown(header, rows):
+    esc = lambda t: (t or "").replace("|", "\\|")
+    n = max([len(header)] + [len(r) for r in rows]) if (header or rows) else 0
+    hdr = header if header else ["col%d" % (i + 1) for i in range(n)]
+    lines = ["| " + " | ".join(esc(h) for h in hdr) + " |", "|" + "---|" * n]
+    for r in rows:
+        lines.append("| " + " | ".join(esc(x) for x in r) + " |")
+    return "\n".join(lines)
 
 
 def _figures_out(figs, blocks):
     out = []
+    seen = Counter()
     regmap = {id(b["obj"]): b for b in blocks if b["kind"] == "region"}
     for fg in figs:
         rb = regmap.get(id(fg))
         cap = fg["caption"]
-        out.append({"id": "%s-%s" % ("figure" if fg["kind"] == "figure" else fg["kind"], fg["number"]),
-                    "kind": fg["kind"], "label": cap["text"].split()[0] + " " + fg["number"], "number": fg["number"],
+        fid = "%s-%s" % ("figure" if fg["kind"] == "figure" else fg["kind"], fg["number"])
+        seen[fid] += 1
+        if seen[fid] > 1:
+            fid += "-part%d" % seen[fid]
+        fg["_id"] = fid
+        out.append({"id": fid,
+                    "kind": fg["kind"], "label": cap.get("label") or (cap["text"].split()[0] + " " + fg["number"]),
+                    "number": fg["number"],
                     "page": fg["page"], "block": rb["id"] if rb else None,
                     "bbox": [round(fg["x0"], 1), round(fg["y0"], 1), round(fg["x1"], 1), round(fg["y1"], 1)],
                     "caption": {"text": cap["text"], "bbox": _bb(cap)},
@@ -977,7 +1153,7 @@ def _public_block(b):
     o = {"id": b["id"], "page": b["page"], "type": b.get("type"), "order": b["order"],
          "bbox": _bb(b), "col": b["col"], "section": b.get("section")}
     if b["kind"] == "region":
-        o["ref"] = ("table-" if b["region"] == "table" else "figure-") + str(b["obj"]["number"])
+        o["ref"] = b["obj"].get("_id") or (("table-" if b["region"] == "table" else "figure-") + str(b["obj"]["number"]))
         o["text"] = b["obj"]["caption"]["text"]
         return o
     o["text"] = b["text"]
