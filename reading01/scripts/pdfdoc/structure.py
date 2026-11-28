@@ -194,6 +194,7 @@ def parse_document(path, pages_spec=None, backend="auto", ocr="auto", ocr_lang="
     blocks = _form_blocks(ordered_pages, body, lead)
     vocab = _vocabulary(pages)
     changes = {"dehyphenation": [], "ligatures_expanded": stats.get("ligatures", 0),
+               "pi_font_glyphs_remapped": stats.get("pi_font_glyphs", 0), "pi_fonts": stats.get("pi_fonts", []),
                "invisible_chars_removed": stats.get("invisible_chars", 0),
                "ocr_numeric_corrections": stats.get("ocr_corrections", [])[:200],
                "furniture_removed": len(furniture), "merged_paragraphs": [],
@@ -211,8 +212,7 @@ def parse_document(path, pages_spec=None, backend="auto", ocr="auto", ocr_lang="
     equations = _equations(blocks)
     tables_out = _tables_out(all_tables, blocks, {pg["page"]: pg["height"] for pg in pages}, changes)
     figures_out = _figures_out(all_figures, blocks)
-    footnotes = [{"id": b["id"], "page": b["page"], "bbox": _bb(b), "text": b["text"]}
-                 for b in blocks if b["type"] == "footnote"]
+    footnotes = [fn for b in blocks if b["type"] == "footnote" for fn in _footnote_items(b)]
     meta = _metadata(blocks)
     # ---- warnings / quality
     for p, info in sorted(pinfo.items()):
@@ -475,8 +475,9 @@ def _is_heading_seg(s, body):
                 return True
             if nw <= 8 and _title_case(title):
                 return True
-    if s["bold"] and nw <= 12 and not t.endswith((".", ",", ";")) and s["size"] >= body * 0.95 and \
-            (t[:1].isupper() or L.is_cjk(t[:1])):
+    if s["bold"] and nw <= 12 and L.word_count(t) <= 14 and not t.endswith((".", ",", ";", "。", "，", "；", "！", "？")) \
+            and s["size"] >= body * 0.95 and (t[:1].isupper() or L.is_cjk(t[:1])) and \
+            not (L.CJK_RE.search(t) and re.search(r"[。；！？]", t[:-1])):
         return True
     if s["size"] >= body * 1.18 and nw <= 14 and not t.endswith("."):
         return True
@@ -706,6 +707,13 @@ def _classify(blocks, body, pages_list):
                 big["x1"], big["y1"] = max(big["x1"], nb["x1"]), max(big["y1"], nb["y1"])
                 nb["type"] = "merged"
                 nb["merged_into"] = big["id"]
+            # a licence / permission note above the title is not a section heading
+            for b in blocks:
+                if b["page"] == 1 and b["order"] < title_idx and b.get("type") == "heading" and \
+                        not NUMBERED_HEAD_RE.match(b["text"].strip()) and \
+                        (len(b["text"]) > 80 or b["text"].rstrip().endswith(TERMINAL)):
+                    b["type"] = "paragraph"
+                    b["note_above_title"] = True
             # front matter: page-1 blocks after the title until abstract / first real heading
             for b in blocks:
                 if b["page"] != 1 or b["order"] <= title_idx or b["kind"] != "text":
@@ -741,13 +749,16 @@ def _classify(blocks, body, pages_list):
             found_abs = True
             break
     if not found_abs:
+        # an unlabeled abstract comes before the first numbered / known section heading
+        first_head = min([b["order"] for b in blocks if b.get("type") == "heading" and
+                          (NUMBERED_HEAD_RE.match(b["text"].strip()) or KNOWN_HEAD_RE.match(b["text"].strip()))]
+                         or [10 ** 9])
         cands = [b for b in blocks if b["page"] == 1 and b["kind"] == "text" and b["type"] in ("paragraph", "front_matter")
-                 and L.word_count(b["text"]) >= 50]
+                 and L.word_count(b["text"]) >= 50 and b["order"] < first_head]
         if cands:
             b = cands[0]
-            if b["col"] == -1 or b["order"] <= min(x["order"] for x in cands):
-                b["type"] = "abstract"
-                b["inferred"] = True
+            b["type"] = "abstract"
+            b["inferred"] = True
     for b in blocks:
         if b.get("kind") == "text" and b["type"] in ("paragraph", "front_matter") and \
                 re.match(r"^(keywords|key\s+words|index\s+terms|关键词)\s*[:：—–-]", b["text"].strip(), re.I):
@@ -757,10 +768,16 @@ def _classify(blocks, body, pages_list):
     for b in blocks:
         if b["kind"] == "text":
             bycol[(b["page"], b["col"])].append(b)
+    abs_sizes = [b["size"] for b in blocks if b.get("type") == "abstract"]
+    abs_size = max(abs_sizes) if abs_sizes else None
     for key, lst in bycol.items():
         lst.sort(key=lambda b: b["y0"])
         for b in reversed(lst):
-            if b["type"] not in ("paragraph", "front_matter", "list_item"):
+            if b["type"] == "abstract":
+                # page-1 author notes / venue line set under the abstract in a smaller size
+                if not (abs_size and b["size"] < 0.9 * abs_size):
+                    break
+            elif b["type"] not in ("paragraph", "front_matter", "list_item"):
                 break
             if b["y0"] < 0.55 * b["page_h"] or b["size"] > body * 0.92:
                 break
@@ -803,6 +820,41 @@ def _classify(blocks, body, pages_list):
             r = sizes.index(round(b["size"])) if round(b["size"]) in sizes else len(sizes)
             lvl = min(1 + r + (0 if b["size"] > body * 1.1 else 1), 4)
         b["level"], b["number"], b["title"] = lvl, num, title
+
+
+FN_MARK_RE = re.compile(r"^\s*(\d{1,3}|[∗*†‡§¶#‖]{1,2})(?=\s*\S)")
+
+
+def _row_starts_with_sup(r):
+    try:
+        w = r["segs"][0]["words"][0]
+    except (KeyError, IndexError):
+        return False
+    return bool(w.get("pieces")) and w["pieces"][0][1] == "sup"
+
+
+def _footnote_items(b):
+    """One entry per footnote: a footnote block may stack several notes ('1 ...' / '2 ...'),
+    each starting on a new line with a superscript marker. Ids stay the block id plus #n."""
+    rows = b.get("rows") or []
+    starts = [i for i, r in enumerate(rows) if i == 0 or (_row_starts_with_sup(r) and FN_MARK_RE.match(r["text"]))]
+    if len(starts) <= 1:
+        m = FN_MARK_RE.match(b["text"])
+        return [{"id": b["id"], "block": b["id"], "page": b["page"], "bbox": _bb(b), "text": b["text"],
+                 "marker": m.group(1) if m else None}]
+    out = []
+    for k, st in enumerate(starts):
+        grp = rows[st:starts[k + 1] if k + 1 < len(starts) else len(rows)]
+        txt = ""
+        for r in grp:
+            rt = r["text"].strip()
+            txt = (txt[:-1] + rt) if txt.endswith("-") and rt[:1].islower() else L.cjk_join(txt, rt)
+        m = FN_MARK_RE.match(txt)
+        out.append({"id": "%s#%d" % (b["id"], k + 1), "block": b["id"], "page": b["page"],
+                    "bbox": [round(min(r["x0"] for r in grp), 1), round(min(r["y0"] for r in grp), 1),
+                             round(max(r["x1"] for r in grp), 1), round(max(r["y1"] for r in grp), 1)],
+                    "text": txt, "marker": m.group(1) if m else None})
+    return out
 
 
 def _sections(blocks):
@@ -1151,7 +1203,126 @@ def _metadata(blocks):
                 meta["abstract_inferred"] = True
         elif t == "keywords" and not meta["keywords"]:
             meta["keywords"] = b["text"]
+    meta.update(_authors(blocks))
     return meta
+
+
+AFFIL_RE = re.compile(
+    r"(universit|institut|college|school|department|dept\b|faculty|laborator|\blabs?\b|research|cent(er|re)\b|academy|"
+    r"hospital|clinic|\binc\b|corp|\bltd\b|\bllc\b|gmbh|foundation|collaboration|observatory|ministry|"
+    r"google|microsoft|facebook|\bmeta\b|deepmind|openai|\bibm\b|nvidia|amazon|apple|baidu|alibaba|tencent|huawei|"
+    r"大学|学院|研究院|研究所|研究中心|实验室|医院|公司|中心|科学院|学校|系\b)", re.I)
+NAME_PARTICLES = {"van", "von", "de", "der", "den", "da", "di", "du", "le", "la", "del", "dos", "bin", "al", "et", "al."}
+MARK_TAIL_RE = re.compile(r"[\s∗*†‡§¶#‖\d,，’'`]+$")
+MARK_HEAD_RE = re.compile(r"^\s*(\d{1,2}|[∗*†‡§¶#‖a-h])(?=\s*[A-Z一-鿿])\s*\.?\s*")
+
+
+def _name_like(t):
+    t = t.strip()
+    if not t or "@" in t or re.search(r"\d{3,}|[()\[\];:]", t) or AFFIL_RE.search(t) or KNOWN_HEAD_RE.match(t):
+        return False
+    if L.CJK_RE.search(t):
+        return bool(re.fullmatch(r"[一-鿿·]{2,5}", t))
+    ws = t.split()
+    if not 1 <= len(ws) <= 5:
+        return False
+    return all(re.match(r"^[A-ZÀ-ÖØ-ÞĀ-ſŁ][\w.'’\-]*$", w) or w.lower() in NAME_PARTICLES for w in ws) and \
+        any(len(w.strip(".")) >= 2 for w in ws)
+
+
+def _split_names(text):
+    """'A, B and C' / 'A·B' / 'Zhang San  Li Si' -> names with their trailing markers."""
+    parts = [x for x in re.split(r"\s*(?:,|，|、|;|\band\b|&)\s*", text) if x and x.strip()]
+    out = []
+    for p in parts:
+        p = p.strip()
+        mk = MARK_TAIL_RE.search(p)
+        markers = re.findall(r"\d{1,2}|[∗*†‡§¶#‖]", mk.group(0)) if mk else []
+        name = MARK_TAIL_RE.sub("", p).strip()
+        if L.CJK_RE.search(name) and " " in name and all(re.fullmatch(r"[一-鿿·]{2,5}", x) for x in name.split()):
+            out.extend((x, []) for x in name.split())
+        elif name:
+            out.append((name, markers))
+    # a marker-only part ("Gomez∗ †" split on space keeps "†" in the tail already)
+    return out
+
+
+def _authors(blocks):
+    """Structured authors / affiliations / e-mails from the page-1 front matter.
+
+    Each item carries page + block + bbox. Association is only made when the layout makes it
+    unambiguous (same column position in an author grid, matching superscript markers, or a
+    single affiliation for everybody); otherwise ``affiliation`` stays null."""
+    fm = [b for b in blocks if b.get("type") == "front_matter" and b["page"] == 1]
+    names, affils, emails = [], [], []
+    for b in fm:
+        for ri, r in enumerate(b["rows"]):
+            for sg in r["segs"]:
+                t = re.sub(r"\s+", " ", sg["text"]).strip()
+                if not t:
+                    continue
+                bb = [round(sg["x0"], 1), round(r["y0"], 1), round(sg["x1"], 1), round(r["y1"], 1)]
+                loc = {"page": b["page"], "block": b["id"], "bbox": bb, "_row": (b["order"], ri)}
+                if "@" in t:
+                    for m in re.finditer(r"[{(\[]([^})\]]*)[})\]]\s*@\s*(\S+)", t):
+                        for u in re.split(r"[,;|\s]+", m.group(1)):
+                            if u.strip():
+                                emails.append(dict(loc, email="%s@%s" % (u.strip(), m.group(2).rstrip(".,;")), shared=True))
+                    rest = re.sub(r"[{(\[]([^})\]]*)[})\]]\s*@\s*(\S+)", " ", t)
+                    for tok in rest.split():
+                        if "@" in tok:
+                            emails.append(dict(loc, email=tok.strip("()<>.,;"), shared=False))
+                    continue
+                mh = MARK_HEAD_RE.match(t)
+                body = t[mh.end():] if mh and (mh.group(1).isdigit() or mh.group(1) in "∗*†‡§¶#‖") else t
+                if AFFIL_RE.search(body) and not _name_like(body):
+                    affils.append(dict(loc, text=body.strip(" ,;"), marker=mh.group(1) if body is not t else None))
+                    continue
+                cand = _split_names(t)
+                if cand and all(_name_like(n) for n, _ in cand):
+                    for n, mk in cand:
+                        names.append(dict(loc, name=n, markers=mk))
+    if not names:
+        return {}
+    by_marker = {a["marker"]: a for a in affils if a.get("marker")}
+
+    def overlap(a, b):
+        return min(a[2], b[2]) - max(a[0], b[0])
+    for n in names:
+        n["affiliation"], n["affiliation_rule"] = None, None
+        hits = [by_marker[m]["text"] for m in n["markers"] if m in by_marker]
+        if hits:
+            n["affiliation"], n["affiliation_rule"] = "; ".join(hits), "superscript marker"
+            continue
+        below = [a for a in affils if a["_row"] > n["_row"] and overlap(a["bbox"], n["bbox"]) > 0.3 * (n["bbox"][2] - n["bbox"][0])]
+        if below:
+            first = min(below, key=lambda a: a["_row"])
+            # nearest grid row only, and the affiliation must not span several author columns
+            same = [a for a in below if a["_row"] == first["_row"]]
+            if len(same) == 1:
+                n["affiliation"], n["affiliation_rule"] = same[0]["text"], "same column, next row"
+                continue
+        if len(set(a["text"] for a in affils)) == 1 and not by_marker:
+            n["affiliation"], n["affiliation_rule"] = affils[0]["text"], "single affiliation for all authors"
+    for n in names:
+        n["email"] = None
+        own = [e for e in emails if not e["shared"] and e["_row"] > n["_row"] and overlap(e["bbox"], n["bbox"]) > 0]
+        if own:
+            n["email"] = min(own, key=lambda e: (e["_row"], abs((e["bbox"][0] + e["bbox"][2]) - (n["bbox"][0] + n["bbox"][2]))))["email"]
+    shared = [e for e in emails if e["shared"]]
+    if shared and len(shared) == len(names) and not any(n["email"] for n in names):
+        for n, e in zip(names, shared):
+            n["email"], n["email_rule"] = e["email"], "brace list, in author order"
+    for lst in (names, affils, emails):
+        for x in lst:
+            x.pop("_row", None)
+    seen, aff_out = set(), []
+    for a in affils:
+        k = (a["text"], a.get("marker"))
+        if k not in seen:
+            seen.add(k)
+            aff_out.append(a)
+    return {"authors": names, "affiliations": aff_out, "emails": emails}
 
 
 def _public_block(b):

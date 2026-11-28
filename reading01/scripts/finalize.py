@@ -121,6 +121,9 @@ def main(argv=None):
     print("result.json -> %s | status=%s | answers=%d | quotes verified %d/%d%s" % (
         out, res["status"], len(ans), nq - len(bad), nq,
         (" (%d matched ignoring spacing/punctuation or around '...')" % len(loose)) if loose else ""))
+    if report or problems:
+        print("=== ACTION REQUIRED: %d issue(s) below; fix answers.json and run finalize.py again "
+              "(result.json is already written, so stopping now still leaves a valid deliverable) ===" % len(report + problems))
     for r in report + problems:
         print("CHECK: " + r)
     if review:

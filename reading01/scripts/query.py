@@ -2,6 +2,7 @@
 """Look things up in parsed documents (document.json) with exact locators.
 
   python3 query.py docs                        # list the parsed documents
+  python3 query.py overview                    # one call: title/authors/abstract, sections, tables, figures, equations, footnotes, checks
   python3 query.py outline                     # section tree with block ids
   python3 query.py search "words|regex" [--type paragraph,table,...] [--max 15] [--literal]   # at most --max hits
   python3 query.py show p3-b12 [--context 1]   # full text + lines + bbox (+ neighbours); also table-2, eq-3, ref-12
@@ -226,6 +227,10 @@ def run(cmd, a, d, path, multi):
                     print(",".join(t.get("header", [])))
                     for r in t.get("matrix", [])[t["header_rows"]:]:
                         print(",".join('"%s"' % x if "," in x else x for x in r))
+                elif t.get("merged") and t["merged"].get("markdown"):
+                    print("table continued across pages: the merged table (parts %s, %d rows) is shown; this part "
+                          "alone is in %s" % (", ".join(t["merged"]["parts"]), t["merged"].get("nrows") or 0, t.get("csv")))
+                    print(t["merged"]["markdown"])
                 else:
                     print(t.get("markdown") or "(no table body in the text layer: see the crop / page preview)")
                 if t.get("merged"):
@@ -260,6 +265,56 @@ def run(cmd, a, d, path, multi):
             shown += 1
     elif c == "ocr":
         n = ocr_region(a, d)
+    elif c == "overview":
+        # everything an extraction task usually needs, in one call (saves model turns)
+        m, src = d["metadata"], d["source"]
+        print("pages %s of %s | %d blocks | %d sections | %d tables | %d figures | %d equations | %d footnotes | %d references" % (
+            src.get("pages_parsed") and "%d-%d" % (min(src["pages_parsed"]), max(src["pages_parsed"])), src.get("pages_total"),
+            len(blocks), len(d["sections"]), len(d["tables"]), sum(1 for f in d["figures"] if f.get("kind") == "figure"),
+            len(d["equations"]), len(d["footnotes"]), len(d["references"])))
+        print("title: %s [%s]" % (m.get("title"), m.get("title_block")))
+        if m.get("authors"):
+            for au in m["authors"]:
+                print("author: %s%s [p%d %s bbox=%s] affiliation=%s%s email=%s" % (
+                    au["name"], "".join(au.get("markers") or []), au["page"], au["block"], au["bbox"], au.get("affiliation"),
+                    " (%s)" % au["affiliation_rule"] if au.get("affiliation_rule") else "", au.get("email")))
+            for af in m.get("affiliations") or []:
+                print("affiliation: %s%s [p%d %s]" % ("(%s) " % af["marker"] if af.get("marker") else "", af["text"], af["page"], af["block"]))
+        else:
+            for x in m.get("front_matter", []):
+                print("front matter [%s]: %s" % (x["block"], x["text"][:200]))
+        if m.get("abstract"):
+            print("abstract %s%s: %s..." % (m.get("abstract_blocks"), " (inferred from layout)" if m.get("abstract_inferred") else "",
+                                           m["abstract"][:300]))
+        if m.get("keywords"):
+            print("keywords: " + m["keywords"])
+        print("-- sections")
+        for s_ in d["sections"]:
+            print("%s%s %s  [p%d %s]" % ("  " * (max(s_["level"], 1) - 1), s_.get("number") or "-", s_["title"], s_["page"], s_["block"]))
+        print("-- tables")
+        for t in d["tables"]:
+            print("%s %s p%d %dx%d hdr=%d%s%s: %s%s" % (t["id"], t["label"], t["page"], t["nrows"], t["ncols"], t["header_rows"],
+                  " IMAGE-ONLY" if t.get("image_only") else "", " merged:%s" % ",".join(t["merged"]["parts"]) if t.get("merged") else "",
+                  t["caption"]["text"][:110], " | issues: %d" % len(t["issues"]) if t.get("issues") else ""))
+        print("-- figures")
+        for f in d["figures"]:
+            print("%s p%d: %s" % (f["id"], f["page"], f["caption"]["text"][:110]))
+        print("-- equations")
+        for e in d["equations"]:
+            print("%s %s p%d: %s" % (e["id"], e.get("number") or "(unnumbered)", e["page"], e["text"][:90]))
+        print("-- footnotes")
+        for f in d["footnotes"][:40]:
+            print("[%s p%d] %s" % (f["id"], f["page"], f["text"][:110]))
+        if d["references"]:
+            r0, r1 = d["references"][0], d["references"][-1]
+            print("-- references: %d (%s p%d ... %s p%d); full list: query.py refs" % (
+                len(d["references"]), r0["id"], r0["page"], r1["id"], r1["page"]))
+        print("-- checks: %s" % d["qa"]["status"])
+        for k in d["qa"]["checks"]:
+            if not k["ok"]:
+                print("[CHECK] %s: %s" % (k["check"], k["value"]))
+        for w in d["warnings"][:15]:
+            print("warning: " + w)
     elif c == "checks":
         print("QA status: %s" % d["qa"]["status"])
         for k in d["qa"]["checks"]:

@@ -127,6 +127,23 @@ def choose_backend(preferred="auto"):
 # helpers
 # --------------------------------------------------------------------------
 
+# Advent 3B2 "pi" (math symbol) fonts used by APS / Elsevier / IOP typesetting carry no usable
+# ToUnicode map: their glyphs come out as Latin-1 letters (z ¼ 0.09þ0.03 = "z = 0.09+0.03").
+PI_FONT_RE = re.compile(r"(^|\+)AdvP[0-9A-F]{3,}")
+PI_FONT_MAP = {"þ": "+", "¼": "=", "ð": "(", "Þ": ")", "½": "[", "Š": "]"}
+
+
+def pi_font_char(ch, font, stats=None):
+    if ch in PI_FONT_MAP and font and PI_FONT_RE.search(font):
+        if stats is not None:
+            stats["pi_font_glyphs"] = stats.get("pi_font_glyphs", 0) + 1
+            fonts = stats.setdefault("pi_fonts", [])
+            if font not in fonts:
+                fonts.append(font)
+        return PI_FONT_MAP[ch]
+    return ch
+
+
 def normalize_text(s, stats=None):
     """Expand ligatures and drop zero-width/soft-hyphen characters."""
     out = []
@@ -338,6 +355,7 @@ def extract_pymupdf(path, pages, stats):
                         ch = c.get("c", "")
                         if not ch:
                             continue
+                        ch = pi_font_char(ch, font, stats)
                         bb = c.get("bbox")
                         org = c.get("origin", (bb[0], bb[3]))
                         chars.append((ch, bb, size, font, bold, ital, float(org[1])))
@@ -483,10 +501,12 @@ def extract_pdfplumber(path, pages, stats):
                 ws = []
             hw, vw = [], []
             for w in ws:
+                fn = w.get("fontname", "")
                 t = normalize_text(w["text"], stats)
+                if PI_FONT_RE.search(fn or ""):
+                    t = "".join(pi_font_char(c, fn, stats) for c in t)
                 if not t.strip():
                     continue
-                fn = w.get("fontname", "")
                 word = _mk_word(t, w["x0"], w["top"], w["x1"], w["bottom"], w.get("size", 10),
                                 fn, _is_bold_font(fn), _is_italic_font(fn))
                 (hw if w.get("upright", True) else vw).append(word)

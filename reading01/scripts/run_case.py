@@ -80,7 +80,8 @@ def main(argv=None):
     print("=" * 78)
     print("CASE %s   (case.json: %s; task.md: %s)" % (cid, case_path, task_path or "-"))
     print("-" * 78)
-    print("TASK:\n" + (ttxt.strip() or "(no task text found; read case.json directly)"))
+    dtxt = C.task_text(case, task_path, display=True)
+    print("TASK:\n" + (dtxt.strip() or "(no task text found; read case.json directly)"))
     print("-" * 78)
     print("OUTPUT CONTRACT fields: %s" % (fields or "(none declared in case.json -> default result.json layout)"))
     if contract:

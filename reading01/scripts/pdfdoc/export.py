@@ -507,6 +507,7 @@ def report_markdown(doc):
           "- page furniture removed from the text flow: %d (running headers/footers, page numbers, margin stamps, line numbers)" % len(doc["furniture"]),
           "- de-hyphenated line breaks: %d; paragraphs joined across columns/pages: %d; ligatures expanded: %s" % (
               len(doc["changes"]["dehyphenation"]), len(doc["changes"]["merged_paragraphs"]), doc["changes"]["ligatures_expanded"]),
+          "- symbol-font glyphs remapped (Advent pi fonts: þ→+ ¼→= ð→( Þ→) ½→[ Š→]): %d" % doc["changes"].get("pi_font_glyphs_remapped", 0),
           "", "## Checks", ""]
     for c in q["checks"]:
         mark = "OK " if c["ok"] else "CHECK"

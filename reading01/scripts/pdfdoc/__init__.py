@@ -10,4 +10,4 @@ used when importable / on PATH: PyMuPDF, pdfplumber, poppler-utils
 (pdftotext, pdftoppm), tesseract (OCR), Pillow (previews).  Everything runs
 locally; no document is sent over the network.
 """
-__version__ = "1.2.0"
+__version__ = "1.3.0"

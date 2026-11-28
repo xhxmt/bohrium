@@ -202,6 +202,73 @@ def test_contract_shapes(scripts, hard, tmp):
           "file %s, quote in %s" % (ev.get("file"), ev.get("quote_check", {}).get("file")))
 
 
+def test_front(scripts, hard, tmp):
+    """Author grid, page-1 notes under the abstract, mean±std table with row spans."""
+    pdf = os.path.join(hard, "front_matter.pdf")
+    if not os.path.exists(pdf):
+        skip("front matter: authors / affiliations / e-mails", "front_matter.pdf not built")
+        return
+    gt = json.load(open(os.path.join(hard, "front_matter.gt.json"), encoding="utf-8"))
+    d = parse(scripts, pdf, os.path.join(tmp, "front"))
+    m = d["metadata"]
+    got = [(a["name"], a.get("affiliation"), a.get("email")) for a in m.get("authors") or []]
+    want = [tuple(x) for x in gt["authors"]]
+    check("front matter: authors with affiliation and e-mail (author grid)", got == want, got)
+    check("front matter: every author has page + bbox", bool(got) and all(a.get("bbox") and a.get("page") for a in m["authors"]))
+    check("abstract: page-1 author notes and venue line are not part of the abstract",
+          norm(m["abstract"]) == norm(gt["abstract"]), (m["abstract"] or "")[-60:])
+    notes = [norm(f["text"]) for f in d["footnotes"] if f["page"] == 1]
+    check("footnotes: symbol-marked notes and the venue line on page 1 are footnotes",
+          all(any(norm(n) in x for x in notes) for n in gt["page1_notes"]), notes)
+    t = find_table(d, "Accuracy with standard deviation")
+    rows = [[norm(c) for c in r] for r in (t or {}).get("matrix", [])[1:]]
+    check("table: row-span labels restored in a table of mean±std and a/b values",
+          rows == [[norm(c) for c in r] for r in gt["pm"]["rows"]], rows[:2])
+
+
+def test_contract_task(scripts, hard, tmp):
+    """Task-derived contract fields are left to the agent; metadata/authors come with locators;
+    a verified quote cited with the wrong block gets the locator where it was found."""
+    pdf = os.path.join(hard, "front_matter.pdf")
+    if not os.path.exists(pdf):
+        skip("contract: task-derived fields left UNFILLED", "front_matter.pdf not built")
+        return
+    work = os.path.join(tmp, "case3")
+    for sub in ("input", "out", "work"):
+        os.makedirs(os.path.join(work, sub), exist_ok=True)
+    shutil.copy(pdf, os.path.join(work, "input", "paper.pdf"))
+    case = {"case_id": "selftest-3", "materials": ["paper.pdf"], "task": "翻译标题与摘要，并给出作者与单位。",
+            "constraints": {"target_language": "zh"},
+            "output_contract": {"fields": ["case_id", "status", "title", "translated_title", "abstract_translation",
+                                           "summary", "metadata", "authors", "evidence", "uncertainties"]}}
+    cp = os.path.join(work, "input", "case.json")
+    json.dump(case, open(cp, "w"), ensure_ascii=False)
+    args = ["--case", cp, "--out", os.path.join(work, "out"), "--work", os.path.join(work, "work")]
+    r = subprocess.run([sys.executable, os.path.join(scripts, "run_case.py")] + args + ["--no-previews"],
+                       capture_output=True, text=True, timeout=600)
+    draft = json.load(open(os.path.join(work, "out", "result.json"), encoding="utf-8"))
+    unf = draft["contract"]["unfilled"]
+    check("contract: translation / summary fields are left UNFILLED for the agent (never the source text)",
+          all(f in unf for f in ("translated_title", "abstract_translation", "summary")), unf)
+    check("contract: other case.json keys (constraints) are shown with the task", "target_language" in r.stdout)
+    au = draft.get("authors") or []
+    check("contract: metadata / authors filled with structured, located values",
+          isinstance(draft.get("metadata"), dict) and draft["metadata"].get("title", {}).get("locator") and
+          all(isinstance(a, dict) and a.get("bbox") for a in au) and len(au) == 3, [type(a).__name__ for a in au])
+    ans = {"status": "success", "answers": [{"question": "q", "answer": "a",
+                                             "evidence": [{"block": "p1-b0", "quote": "keeps the index size fixed"}]}]}
+    ap = os.path.join(work, "work", "answers.json")
+    json.dump(ans, open(ap, "w"))
+    subprocess.run([sys.executable, os.path.join(scripts, "finalize.py"), "--answers", ap,
+                    "--state", os.path.join(work, "work", "pdfdoc_state.json")], capture_output=True, text=True,
+                   timeout=300)
+    res = json.load(open(os.path.join(work, "out", "result.json"), encoding="utf-8"))
+    ev = ((res.get("skill_details") or {}).get("answers") or res.get("answers") or [{}])[0].get("evidence", [{}])[0]
+    check("evidence: quote cited with the wrong block is relocated to the block that holds it",
+          ev.get("cited_block") == "p1-b0" and ev.get("block") != "p1-b0" and ev.get("locator_corrected"),
+          {k: ev.get(k) for k in ("block", "cited_block", "locator_corrected")})
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("hard_dir")
@@ -209,7 +276,8 @@ def main():
     a = ap.parse_args()
     scripts = os.path.abspath(a.scripts)
     tmp = tempfile.mkdtemp(prefix="pdfdoc_selftest_")
-    for fn in (test_tables, test_zh, test_short, test_scan, test_contract, test_contract_shapes):
+    for fn in (test_tables, test_zh, test_short, test_scan, test_contract, test_contract_shapes, test_front,
+               test_contract_task):
         try:
             fn(scripts, a.hard_dir, tmp)
         except Exception as e:  # a crash is a failed check, not a crashed test run

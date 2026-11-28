@@ -373,19 +373,45 @@ def contract_specs(contract):
     return specs
 
 
-def task_text(case, task_md_path=None, limit=16000):
+GENERIC_TASK_MD_RE = re.compile(r"SKILL\.md|/app/submission|评分维度|Skill authoring task|交付要求")
+
+
+def task_text(case, task_md_path=None, limit=16000, display=False):
+    """Task wording from case.json (task keys first, then every other top-level key such as
+    constraints / evidence scope / target language) plus task.md.
+
+    display=True: what run_case prints. A task.md that is the generic topic statement for Skill
+    authors (it mentions SKILL.md, /app/submission, the scoring table ...) is shortened to its
+    opening lines when case.json has its own task, so it does not crowd every later turn."""
     parts = []
     nc = {k: v for k, v in case.items() if not _in_contract("/" + str(k))} if isinstance(case, dict) else case
+    seen = set()
     for k in TASK_KEYS:
         r = find_key(nc, [k])
         if r:
             v = r[1]
+            seen.add(str(r[0]).split("/")[-1].split(".")[-1])
             parts.append("%s: %s" % (r[0], v if isinstance(v, str) else json.dumps(v, ensure_ascii=False)))
+    has_task = bool(parts)
+    if isinstance(nc, dict):
+        extra = {k: v for k, v in nc.items() if k not in seen and k not in TASK_KEYS and not str(k).startswith("_")
+                 and k not in ("case_id", "caseId", "id")}
+        if extra:
+            ej = json.dumps(extra, ensure_ascii=False)
+            parts.append("other case.json fields (constraints, materials, scope ...): " +
+                         (ej if len(ej) <= 4000 else ej[:4000] + " ...[read case.json for the rest]"))
     if "_raw_text" in case:
         parts.append(case["_raw_text"])
     if task_md_path and os.path.isfile(task_md_path):
         with open(task_md_path, encoding="utf-8", errors="replace") as fh:
-            parts.append("task.md:\n" + fh.read())
+            md = fh.read()
+        if display and has_task and len(md) > 1500 and GENERIC_TASK_MD_RE.search(md):
+            parts.append("task.md (%d chars) is the general topic statement written for Skill authors; the case "
+                         "task is the case.json text above. Opening lines:\n%s\n...[full text: %s - its "
+                         "'create SKILL.md / submit to /app/submission' parts are not this case's job]" % (
+                             len(md), md[:900].rstrip(), task_md_path))
+        else:
+            parts.append("task.md:\n" + md)
     t = "\n".join(parts)
     if len(t) > limit:
         return t[:limit] + "\n...[TRUNCATED at %d characters: read %s and case.json in full before answering]" % (
@@ -440,7 +466,23 @@ ZH_MAP = (("标题", "title"), ("题目", "title"), ("作者", "authors"), ("单
           ("来源", "sources"), ("依据", "evidence"), ("答案", "answers"), ("回答", "answers"), ("结论", "conclusion"),
           ("不确定", "uncertainties"), ("未报告", "not_reported"), ("状态", "status"), ("原因", "reason"),
           ("修改", "change"), ("变更", "change"), ("段落", "paragraphs"), ("全文", "full_text"), ("正文", "full_text"),
-          ("语言", "language"))
+          ("语言", "language"), ("翻译", "translation"), ("译文", "translation"), ("中译", "translation"),
+          ("英译", "translation"), ("总结", "summary"), ("概括", "summary"), ("综述", "summary"), ("知识", "knowledge"),
+          ("实体", "entity"), ("关系", "relation"), ("分析", "analysis"), ("比较", "comparison"), ("对比", "comparison"),
+          ("核验", "verification"), ("冲突", "conflict"), ("解释", "explanation"), ("贡献", "contribution"))
+
+# Field names that ask for the agent's own work on the paper (translation, summary, knowledge
+# structure, comparison, verification ...). The parse holds only the original text, so such a
+# field is never filled automatically: "translated_title" must not receive the English title.
+TASK_DERIVED_PREFIXES = ("translat", "summar", "analy", "compar", "knowledge", "entit", "relation", "triple", "claim",
+                         "judg", "verdict", "verif", "conflict", "explan", "interpret", "insight", "highlight",
+                         "glossar", "bilingual", "contribution", "critique", "review", "recommend", "takeaway")
+TASK_DERIVED_WORDS = {"zh", "cn", "chinese", "english", "en", "kg", "graph", "concept", "concepts", "mindmap", "gist"}
+
+
+def task_derived(field):
+    toks = _norm_tokens(field)
+    return any(t.startswith(TASK_DERIVED_PREFIXES) for t in toks) or bool(set(toks) & TASK_DERIVED_WORDS)
 
 
 def _norm_tokens(field):
@@ -493,6 +535,8 @@ def auto_value(field, docs, case_id_, status, reason):
         return status, "run status", None
     if ts & {"reason", "message"} and ts <= {"status", "reason", "message", "run", "failure", "error"}:
         return reason, "status reason", None
+    if task_derived(field):
+        return None, None, None
     if not docs:
         return None, None, None
     one = len(docs) == 1
@@ -531,9 +575,32 @@ def auto_value(field, docs, case_id_, status, reason):
     if "title" in ts and not ts & {"section", "table", "figure", "chapter", "heading", "reference", "caption"}:
         return (per_doc(lambda d: d["metadata"]["title"]), "title block",
                 locs(lambda d: [d["metadata"]["title_block"]] if d["metadata"]["title_block"] else []))
-    if ts & {"author", "affiliation", "front", "institution"}:
-        return (per_doc(lambda d: [x["text"] for x in d["metadata"]["front_matter"]]), "front-matter blocks after the title",
-                locs(lambda d: [x["block"] for x in d["metadata"]["front_matter"]]))
+    if ts & {"metadata", "meta", "bibliographic", "front"} and not ts & {"page", "table", "figure"}:
+        return per_doc(_metadata_value), "title / authors / affiliations / abstract blocks with locators", None
+    if ts & {"affiliation", "institution", "organization", "organisation"} and not ts & {"author"}:
+        def affs(d):
+            m = d["metadata"]
+            if m.get("affiliations"):
+                return m["affiliations"]
+            return [x["text"] for x in m["front_matter"]]
+        return per_doc(affs), "affiliations (page-1 front matter)", None
+    if ts & {"email", "mail", "contact"}:
+        return per_doc(lambda d: d["metadata"].get("emails") or []), "e-mail addresses (page-1 front matter)", None
+    if ts & {"author", "front"}:
+        def auths(d):
+            m = d["metadata"]
+            if m.get("authors"):
+                return m["authors"]
+            return [x["text"] for x in m["front_matter"]]
+        return (per_doc(auths), "authors with affiliation / e-mail where the layout makes it unambiguous "
+                "(affiliation_rule tells how); otherwise front-matter blocks", locs(lambda d: [x["block"] for x in d["metadata"]["front_matter"]]))
+    if "ocr" in ts or (ts & {"recognition"} and ts & {"quality", "confidence"}):
+        return per_doc(_ocr_value), "OCR engine, per-page language / mean confidence / low-confidence words", None
+    if ts & {"block", "chunk", "segment", "span"} and (ts & {"text", "content"} or ts <= {"block", "chunk", "segment", "span"}):
+        return (per_doc(lambda dd: [{"id": b["id"], "page": b["page"], "type": b["type"], "bbox": b["bbox"],
+                                     "section": b.get("section"), "text": b["text"]}
+                                    for b in dd["blocks"] if b["type"] not in ("empty",)]),
+                "text blocks in reading order (id, page, bbox, type)", None)
     if "abstract" in ts:
         return (per_doc(lambda d: d["metadata"]["abstract"]), "abstract block(s)%s" % (
             " (inferred from layout)" if any(x["doc"]["metadata"].get("abstract_inferred") for x in docs) else ""),
@@ -548,7 +615,7 @@ def auto_value(field, docs, case_id_, status, reason):
         return per_doc(kws), "keywords line", None
     if ts & {"section", "outline", "heading", "hierarchy", "toc", "chapter", "structure"}:
         return (per_doc(lambda dd: [{"id": s["id"], "level": s["level"], "number": s["number"], "title": s["title"],
-                                     "page": s["page"], "block": s["block"], "parent": s["parent"]}
+                                     "page": s["page"], "block": s["block"], "bbox": s.get("bbox"), "parent": s["parent"]}
                                     for s in dd["sections"]]), "section tree", None)
     if "table" in ts:
         return per_doc(lambda dd: [table_summary(dd, t) for t in dd["tables"]]), "tables (cells)", None
@@ -595,6 +662,43 @@ def auto_value(field, docs, case_id_, status, reason):
                                     "paragraphs": sum(1 for b in dd["blocks"] if b["type"] == "paragraph")}),
                 "pointer to the parse outputs", None)
     return None, None, None
+
+
+def _metadata_value(d):
+    m = d["metadata"]
+    byid = {b["id"]: b for b in d["blocks"]}
+
+    def loc(bid):
+        b = byid.get(bid)
+        return {"page": b["page"], "block": bid, "bbox": b["bbox"]} if b else None
+    out = {"file": os.path.basename(d["source"]["file"]), "pages_total": d["source"].get("pages_total"),
+           "title": {"text": m.get("title"), "locator": loc(m.get("title_block"))} if m.get("title") else None,
+           "authors": m.get("authors") or [x["text"] for x in m["front_matter"]],
+           "affiliations": m.get("affiliations") or [],
+           "emails": [e["email"] for e in m.get("emails") or []],
+           "front_matter_blocks": [loc(x["block"]) for x in m["front_matter"]],
+           "abstract": {"text": m.get("abstract"), "locators": [loc(b) for b in m.get("abstract_blocks", [])],
+                        "inferred_from_layout": bool(m.get("abstract_inferred"))} if m.get("abstract") else None,
+           "keywords": m.get("keywords")}
+    return out
+
+
+def _ocr_value(d):
+    o = d.get("ocr") or {}
+    pages = [p for p in d["pages"] if p.get("status") == "ocr" or str(p.get("source", "")).startswith("ocr")]
+    if not o and not pages:
+        return {"ocr_used": False, "note": "all parsed pages have a text layer; no OCR was needed"}
+    per = []
+    for p in o.get("pages", []):
+        per.append({"page": p["page"], "lang": p.get("lang"), "mean_conf": p.get("mean_conf"), "words": p.get("words"),
+                    "low_conf_words": [{"text": w[0], "conf": w[1], "bbox": w[2]} for w in p.get("low_conf_words", [])],
+                    "preprocess": p.get("preprocess")})
+    confs = [p["mean_conf"] for p in per if p.get("mean_conf") is not None]
+    return {"ocr_used": True, "engine": o.get("engine"), "pages": per,
+            "mean_conf": round(sum(confs) / len(confs), 1) if confs else None,
+            "low_conf_word_count": sum(len(p["low_conf_words"]) for p in per),
+            "numeric_corrections": (d.get("changes") or {}).get("ocr_numeric_corrections", [])[:50],
+            "note": "tesseract word confidence 0-100; words below the threshold are listed with page bbox (PDF pt)"}
 
 
 def json_type(v):
@@ -666,12 +770,15 @@ def coerce(v, expected):
     return None
 
 
-def table_summary(doc, t, max_rows=60):
+def table_summary(doc, t, max_rows=150):
+    body = t.get("matrix", [])[t.get("header_rows", 0):]
     o = {"id": t["id"], "label": t["label"], "caption": t["caption"]["text"], "page": t["page"], "bbox": t["bbox"],
          "nrows": t["nrows"], "ncols": t["ncols"], "header_rows": t["header_rows"], "header": t.get("header"),
-         "rows": t.get("matrix", [])[t.get("header_rows", 0):][:max_rows], "csv": t.get("csv"),
+         "rows": body[:max_rows], "csv": t.get("csv"),
          "html": t.get("html_file"), "crop": t.get("crop"), "issues": t.get("issues", []),
          "image_only": t.get("image_only", False)}
+    if len(body) > max_rows:
+        o["rows_truncated"] = {"shown": max_rows, "total": len(body), "full_table": t.get("csv")}
     for k in ("body_source", "continued_from", "continued_in", "uncaptioned"):
         if t.get(k):
             o[k] = t[k]
@@ -693,6 +800,7 @@ _CJK = r"　-〿㐀-䶿一-鿿豈-﫿＀-￯"
 
 def _norm(s):
     s = unicodedata.normalize("NFKC", s or "").translate(_QUOTES)
+    s = re.sub(r"\\([_*`#\[\]|<>~])", r"\1", s)  # Markdown escapes copied from document.md (conv3\_x)
     s = re.sub(r"<[^>]+>", "", s)
     s = re.sub(r"(?<=[A-Za-z])-\s+(?=[a-z])", "", s)
     s = s.replace("|", " ")  # table rows are shown as "a | b | c" by query.py but stored cell-joined
@@ -728,6 +836,18 @@ def _quote_pools(d):
         for g in t.get("grid", []):
             pools.append(({"id": tid, "obj": t["id"], "page": t["page"], "bbox": g["bbox"], "type": "table"},
                           " ".join(c["text"] for c in g["cells"])))
+        # rows as query.py table / the CSV show them: rowspan labels repeated, header joined
+        grid = t.get("grid", [])
+        for ri, row in enumerate(t.get("matrix") or []):
+            bb = grid[ri]["bbox"] if ri < len(grid) and len(grid) == len(t.get("matrix") or []) else t["bbox"]
+            pools.append(({"id": tid, "obj": t["id"], "page": t["page"], "bbox": bb, "type": "table"},
+                          " ".join(str(c) for c in row)))
+        if t.get("header"):
+            pools.append(({"id": tid, "obj": t["id"], "page": t["page"], "bbox": t["bbox"], "type": "table"},
+                          " ".join(str(c) for c in t["header"])))
+        for row in (t.get("merged") or {}).get("matrix") or []:
+            pools.append(({"id": tid, "obj": t["id"], "page": t["page"], "bbox": t["bbox"], "type": "table"},
+                          " ".join(str(c) for c in row)))
         pools.append(({"id": tid, "obj": t["id"], "page": t["page"], "bbox": t["bbox"], "type": "table"},
                       t["caption"]["text"]))
     for f in d["figures"]:
@@ -925,6 +1045,9 @@ def build_result(case, case_path, cid, docs, parse_failures, answers=None, task_
                         "dehyphenation_examples": ch["dehyphenation"][:5],
                         "paragraphs_joined_across_columns_or_pages": ch["merged_paragraphs"],
                         "ligatures_expanded": ch["ligatures_expanded"],
+                        "symbol_font_glyphs_remapped": {"count": ch.get("pi_font_glyphs_remapped", 0), "fonts": ch.get("pi_fonts", []),
+                                                        "map": "þ→+ ¼→= ð→( Þ→) ½→[ Š→] (Advent pi fonts without ToUnicode)"}
+                        if ch.get("pi_font_glyphs_remapped") else None,
                         "ocr_numeric_corrections": ch.get("ocr_numeric_corrections", [])[:20],
                         "table_cell_repairs": ch.get("table_repairs", [])[:30],
                         "note": "original line text and coordinates are kept in document.json blocks[].lines"})
@@ -986,6 +1109,12 @@ def build_result(case, case_path, cid, docs, parse_failures, answers=None, task_
                 item["quote_check"] = v
                 if v["verified"] and not b:
                     item.update({"file": v["file"], "page": v["page"], "bbox": v["bbox"], "block": v["block"]})
+                elif v["verified"] and b and "(cited " in (v.get("how") or ""):
+                    # the quote is real but sits elsewhere: point the locator at where it was found
+                    item["cited_block"] = bid
+                    item.update({"file": v["file"], "page": v["page"], "bbox": v["bbox"], "block": v["block"],
+                                 "locator_corrected": True})
+                    item.pop("object", None)
                 if not v["verified"]:
                     unc.append({"issue": "unverified quote for answer '%s'" % str(a.get("question", a.get("id", "")))[:80],
                                 "quote": item["quote"][:200]})

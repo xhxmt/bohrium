@@ -11,6 +11,8 @@ Writes OUTDIR/<case>.pdf and OUTDIR/<case>.gt.json for:
   short_furniture  one-page document: journal line, DOI line and copyright line that
                 appear once (no repetition to learn from) + page number
   scan_mixed    image-only PDF: page 1 English, pages 2-3 Chinese (OCR language per page)
+  front_matter  author grid (name / affiliation / e-mail), symbol footnotes and a venue line
+                under the abstract, stacked body footnotes, a mean±std table with row spans
 The ground truth is written from the same Python data that generates the LaTeX, so it
 is exact. selftest.py checks the parser against it.
 """
@@ -140,6 +142,53 @@ def short_tex():
         r"\section{Introduction}", para(1), "", para(2), r"\section{Method}", para(3), "", para(4), r"\end{document}"])
 
 
+FRONT = {"title": "Sparse Gating for Efficient Retrieval",
+         "authors": [("Alice Zhang", "Example University", "alice@example.edu"),
+                     ("Bob Miller", "Example Labs", "bob@example.com"),
+                     ("Carol Diaz", "Northern Institute of Technology", "carol@nit.example.org")],
+         "abstract": ("We study sparse gating for dense retrieval. A small router selects a few experts per query, "
+                      "which keeps the index size fixed while the quality of the ranking improves on every benchmark "
+                      "we tried. The method needs no extra labels and trains in one pass."),
+         "notes": ["Equal contribution.", "Work done during an internship.", "Preprint. Under review."],
+         "body_notes": ["The dataset is released under a research licence.", "Code is available on request."],
+         "pm": {"header": ["Dataset", "Method", "Acc", "F1"],
+                "groups": [("CIFAR", [("A", "82.3±0.4", "80.6/80.1"), ("B", "84.1±0.2", "81.2/80.9"), ("C", "85.0±0.3", "82.4/82.0")]),
+                           ("SVHN", [("A", "92.3±0.1", "90.6/90.1"), ("B", "93.1±0.2", "91.2/90.9"), ("C", "94.0±0.3", "92.4/92.0")])]}}
+
+
+def front_tex():
+    """Author grid (name / affiliation / e-mail columns), symbol footnotes and a venue line set
+    under the abstract, two stacked body footnotes, and a table of mean±std and a/b values
+    with row-spanning dataset labels."""
+    au = FRONT["authors"]
+    marks = [r"$^{*}$", r"$^{*}$", r"$^{\dagger}$"]
+    pm = FRONT["pm"]
+    rows = []
+    for name, grp in pm["groups"]:
+        for k, r in enumerate(grp):
+            lab = r"\multirow{%d}{*}{%s}" % (len(grp), name) if k == 0 else ""
+            rows.append("%s & %s \\\\" % (lab, " & ".join(r)))
+    return "\n".join([
+        r"\documentclass[10pt]{article}", r"\usepackage[a4paper,margin=2.5cm]{geometry}",
+        r"\usepackage{booktabs,multirow}", r"\pagestyle{plain}", r"\begin{document}",
+        r"\begin{center}{\LARGE\bfseries %s}\\[2em]" % FRONT["title"],
+        r"\begin{tabular}{ccc}",
+        " & ".join("%s%s" % (n, m) for (n, _, _), m in zip(au, marks)) + r" \\",
+        " & ".join(a for _, a, _ in au) + r" \\",
+        " & ".join(r"\texttt{%s}" % e for _, _, e in au) + r" \\",
+        r"\end{tabular}\end{center}", r"\vspace{1em}",
+        r"\begin{center}\textbf{Abstract}\end{center}", FRONT["abstract"], "",
+        r"\renewcommand{\thefootnote}{\fnsymbol{footnote}}",
+        r"\footnotetext[1]{%s}" % FRONT["notes"][0], r"\footnotetext[2]{%s}" % FRONT["notes"][1],
+        r"\renewcommand{\thefootnote}{}", r"\footnotetext{%s}" % FRONT["notes"][2],
+        r"\renewcommand{\thefootnote}{\arabic{footnote}}", r"\setcounter{footnote}{0}",
+        r"\newpage", r"\section{Introduction}",
+        para(1) + r"\footnote{%s} " % FRONT["body_notes"][0] + para(2) + r"\footnote{%s}" % FRONT["body_notes"][1], "",
+        r"\begin{table}[h]\centering\caption{Accuracy with standard deviation}",
+        r"\begin{tabular}{llcc}\toprule", " & ".join(pm["header"]) + r" \\\midrule"] + rows + [
+        r"\bottomrule\end{tabular}\end{table}", para(3), r"\end{document}"])
+
+
 def xelatex(out, name, src):
     with open(os.path.join(out, name + ".tex"), "w", encoding="utf-8") as fh:
         fh.write(src)
@@ -180,6 +229,13 @@ def main(out):
     with open(os.path.join(out, "zh_noabstract.gt.json"), "w", encoding="utf-8") as fh:
         json.dump({"title": "交联固态聚合物电解质的设计与性能", "abstract": ZH_ABS,
                    "first_body_paragraph_starts": "第1节第1段"}, fh, ensure_ascii=False, indent=1)
+    ok &= xelatex(out, "front_matter", front_tex())
+    with open(os.path.join(out, "front_matter.gt.json"), "w", encoding="utf-8") as fh:
+        json.dump({"title": FRONT["title"], "authors": FRONT["authors"], "abstract": FRONT["abstract"],
+                   "page1_notes": FRONT["notes"], "body_notes": FRONT["body_notes"],
+                   "pm": {"header": FRONT["pm"]["header"],
+                          "rows": [[n] + list(r) for n, grp in FRONT["pm"]["groups"] for r in grp]}},
+                  fh, ensure_ascii=False, indent=1)
     ok &= xelatex(out, "short_furniture", short_tex())
     with open(os.path.join(out, "short_furniture.gt.json"), "w", encoding="utf-8") as fh:
         json.dump(dict(SHORT, page_number="101"), fh, ensure_ascii=False, indent=1)

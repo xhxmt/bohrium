@@ -20,8 +20,11 @@ python3 /skills/weekly-skill/scripts/run_case.py   # 默认读 /input/case.json 
 - case.json 指定了材料时只解析这些；其余输入文件列在 `OTHER input files`，需要时用 `--material 路径` 加入。多份材料时 `query.py` 默认查全部文档（`query.py docs` 列出，`--doc 文件名` 选一份）。
 - 解析产物（`/app/output/parsed/`）：`document.md`（阅读顺序全文，每块前有 `<!-- 块id 页 [bbox] 类型 -->` 锚点）、`document.json`（全部结构）、`parse_report.md`（自检：与独立提取器的文字覆盖率、表/图/公式/文献编号连续性、可疑断句、OCR 置信度）、`tables/*.csv|html|md`、`crops/*.png`（表格/公式/图截图）、`previews/page-*.png`（阅读顺序标注图）。
 
-**第 2 步 — 按任务取证据（不要整篇 cat；用查询）**
+**第 2 步 — 按任务取证据（不要整篇 cat；用查询；一次 bash 调用里用 `;` 串起多条查询，省轮次）**
 ```bash
+Q="python3 /skills/weekly-skill/scripts/query.py"
+$Q overview                                     # 一条命令看全貌：标题、作者/单位/邮箱（带 bbox）、摘要、章节树、表/图/公式/脚注清单、自检
+$Q table 1; $Q table 2; $Q search "GPU|K80"     # 多条查询合并成一次调用
 python3 /skills/weekly-skill/scripts/query.py outline                 # 章节树 + 块 id
 python3 /skills/weekly-skill/scripts/query.py search "关键词|regex"    # 命中块/表格行/图内文字/文献（最多 --max 条，默认 15），带 [块id 页 bbox 类型]；含括号等字符时按原文搜索（或加 --literal）
 python3 /skills/weekly-skill/scripts/query.py show p5-b3 --context 1  # 块全文、逐行 bbox、跨栏续接关系（也可 show table-2 / eq-3 / ref-12）
@@ -51,6 +54,12 @@ python3 /skills/weekly-skill/scripts/finalize.py   # 合并答案→/app/output/
 契约字段内容很多（整张表、几十条记录、长文本）时，不要在一次回复里手写整个 JSON（单次回复上限 16384 token）：写一段简短的 python3 脚本，从 `/app/output/parsed/document.json`（`tables[].matrix`、`sections`、`blocks`）取值生成 `/app/work/answers.json`。
 若输出 `CHECK:`（引文未在原文找到、契约字段缺失/为空/类型不符、契约要求的文件不存在），修正后再运行一次；`REVIEW:` 行列出自动填充的字段，确认它们确实回答了契约的要求，否则在 `fields` 中改写。`block` 可填块 id（`p3-b12`）或对象 id（`table-2`、`eq-3`、`figure-1`、`ref-12`）。
 
+**按任务类型的做法**（证据一律带 `block` + 逐字 `quote`）
+- 结构化解析（标题/作者/章节/表格/公式/参考文献…）：契约字段多数已由草稿自动填好（`metadata.authors` 已按版面拆出姓名、单位、邮箱并注明 `affiliation_rule`）；先看 run_case 的 `auto:` 清单，只改错的、补 `UNFILLED` 的，不要重新手抄整篇。
+- 问答 / 抽取：每个问题一条 `answers[]`，数值从表格单元格或原文块复制；原文没有 → `not_reported`，不要推测。
+- 翻译 / 总结 / 知识结构化：脚本不会自动填这类字段（`translated_*`、`summary`、`knowledge_*` 等一律 `UNFILLED`），由你写；按块或按节对应原文，每段/每个节点给出 `page` + `block`，章节编号、公式编号、表号、数值、单位原样保留，术语前后一致。
+- 核验 / 多材料对比：两份材料各自引用（`file` + `block` + `quote`）；冲突就两边都列出并写进 `uncertainties`，无法判断写 `cannot_determine`。
+
 ## 规则
 - **要完成的是本案例的解析/问答任务**：以 `case.json`（任务、材料、output_contract）为准。若 `task.md` 里是面向 Skill 作者的说明（如“编写 SKILL.md”“提交到 /app/submission”），那不是本次要做的事：不要创建或修改 Skill 文件、`/app/submission`，只把结果写到 `/app/output`。
 - **只写原文中有的内容**。找不到 → 写入 `not_reported` 或 status=`cannot_determine`，不要补造；材料冲突时两处都引用并说明。
@@ -60,6 +69,10 @@ python3 /skills/weekly-skill/scripts/finalize.py   # 合并答案→/app/output/
 - 解析结果的已知边界见 `parse_report.md`：表格只有题注无表体（可能是图片表格）、OCR 低置信词、可疑断句块——在 `uncertainties` 中如实列出，不要掩盖。
 - 异常：加密 PDF / 损坏文件 → run_case 打印 FAILED 原因，status=`failed` 并写明人工接管方式；无文字层且无 OCR 引擎 → status=`partial`，列出需 OCR 的页；脚本崩溃 → 用 `python3 /skills/weekly-skill/scripts/parse_pdf.py PDF --out /app/output/parsed --backend poppler` 重试，再不行用 `pdftotext -layout` 兜底并在 status_reason 说明。
 - 预算：64 次模型调用 / 900 秒。目标 ≤ 15 轮：第 1 步 1 轮，查证 3–8 轮，写 answers + finalize 2–3 轮。不要修改脚本，不要重复解析同一文件。
+- 不要另写脚本从 PDF 重新提取表格、重建 `document.md` 或重新排版结果（这些已在 `/app/output/parsed/`，契约要的文件直接复制）；某个单元格或字段确有错误时，只在 `fields` 里改那一处并在 `uncertainties` 写明依据。用到 30 轮左右还没收尾时，立即写 answers.json 并运行 finalize。
+
+## 交付前自检（finalize 之后）
+finalize 输出没有 `CHECK:`；没有意外的 `UNFILLED`；`REVIEW:` 列出的自动字段确实回答了题目；契约要求的文件都在 `/app/output/`；`status` 与实际完成度一致（全部完成才写 success）。
 
 ## 最终回复
 用 3–6 行说明：status、输出位置（`/app/output/result.json`、`/app/output/parsed/document.md`）、关键结论及其 `页码/块id`、主要不确定项。

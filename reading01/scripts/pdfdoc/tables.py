@@ -13,7 +13,12 @@ CAPTION_RE = re.compile(
     r"(?P<punc>\s*[.:：|]|\s+[-–—]\s|\s+)?(?P<rest>.*)$")
 CONTINUED_RE = re.compile(r"^\s*[(（\[]?\s*(continued|cont(?:inued|'d|\.)?|续(?:表|上表)?)\s*[)）\]]?", re.I)
 CJK_KINDS = ("图", "表", "续表", "附表", "附图")
-NUMERIC_RE = re.compile(r"^[\(\[]?[-−+±~≈<>]?\d[\d.,]*(e[-+]?\d+)?%?[\)\]]?[*†‡]*$|^[-–—]$|^n/?a$", re.I)
+# a single number: column splitting uses this one, so "7.54 (7.72±0.16)" stays one cell
+NUMERIC_STRICT_RE = re.compile(r"^[\(\[]?[-−+±~≈<>]?\d[\d.,]*(e[-+]?\d+)?%?[\)\]]?[*†‡]*$|^[-–—]$|^n/?a$", re.I)
+# a value cell for row/column typing (row-span labels, header rows): also 82.3±0.4, 80.6/80.1, 84.1(0.2)
+_NUM = r"[-−+±~≈<>]?\d[\d.,]*(?:e[-+−]?\d+)?%?"
+NUMERIC_RE = re.compile(r"^[\(\[]?" + _NUM + r"(?:(?:±|\+/-|/|±\s)" + r"\d[\d.,]*%?|\(\d[\d.,]*%?\))?[\)\]]?[*†‡]*$|^[-–—]$|^n/?a$",
+                        re.I)
 
 
 def caption_info(seg):
@@ -600,7 +605,7 @@ def _figure_region(pg, cap, wx0, wx1, size, rows):
 # --------------------------------------------------------------------------
 
 def _numlike(t):
-    return bool(NUMERIC_RE.match(t)) or t in ("-", "–", "—", "/", "x", "✓", "✗")
+    return bool(NUMERIC_STRICT_RE.match(t)) or t in ("-", "–", "—", "/", "x", "✓", "✗")
 
 
 def _resplit(seg_list, size, factor=0.55):
@@ -651,6 +656,90 @@ def _split_on_seps(c, seps):
     return out
 
 
+# big delimiters built from pieces (TeX cmex / Symbol private-use code points) and U+FFFD
+_LEFT_PIECES = {"\uf8eb": "(", "\uf8ec": "(", "\uf8ed": "(", "\uf8ee": "[", "\uf8ef": "[", "\uf8f0": "[",
+                "\uf8f1": "{", "\uf8f2": "{", "\uf8f3": "{"}
+_RIGHT_PIECES = {"\uf8f6": ")", "\uf8f7": ")", "\uf8f8": ")", "\uf8f9": "]", "\uf8fa": "]", "\uf8fb": "]",
+                 "\uf8fc": "}", "\uf8fd": "}", "\uf8fe": "}"}
+_DELIM_RE = re.compile("[\ue000-\uf8ff\ufffd]+")
+
+
+def _order_stacked(line):
+    """Cells of one table row that fall into the same column but sit on different text lines
+    (a row made tall by a big bracket: ResNet's [3x3, 64 / 3x3, 64] x2 blocks) are read line by
+    line, top to bottom, instead of by x alone; delimiter pieces become one '[' ... ']' pair."""
+    if len(line) < 2:
+        return line, None
+    out, notes = [], []
+    i = 0
+    while i < len(line):
+        j = i
+        while j + 1 < len(line) and line[j + 1]["col"] == line[i]["col"] and line[j + 1]["colspan"] == line[i]["colspan"]:
+            j += 1
+        grp = line[i:j + 1]
+        i = j + 1
+        heights = [c["bbox"][3] - c["bbox"][1] for c in grp]
+        stacked = len(grp) > 1 and any(
+            a["bbox"][1] >= b["bbox"][3] - 0.3 * min(ha, hb) or b["bbox"][1] >= a["bbox"][3] - 0.3 * min(ha, hb)
+            for a, ha in zip(grp, heights) for b, hb in zip(grp, heights))
+        has_delim = any(_DELIM_RE.search(c["text"]) for c in grp)
+        if not stacked and not has_delim:
+            out.extend(grp)
+            continue
+        delims, texts = [], []
+        for c in grp:
+            m = _DELIM_RE.match(c["text"])
+            if m:
+                delims.append((c["bbox"][0], m.group(0)))
+                rest = c["text"][m.end():].strip()
+                if rest:
+                    texts.append(dict(c, text=rest, rich=_DELIM_RE.sub("", c["rich"]).strip(),
+                                      bbox=[c["bbox"][0] + 0.01] + c["bbox"][1:]))
+            else:
+                t = _DELIM_RE.sub(" ", c["text"]).strip()
+                if t:
+                    texts.append(dict(c, text=t, rich=_DELIM_RE.sub(" ", c["rich"]).strip()))
+
+        def read(ps):  # visual lines top-down, left-right inside a line
+            ps = sorted(ps, key=lambda c: (c["bbox"][1] + c["bbox"][3]) / 2.0)
+            lines_ = []
+            for c in ps:
+                cy, h = (c["bbox"][1] + c["bbox"][3]) / 2.0, c["bbox"][3] - c["bbox"][1]
+                if lines_ and abs(cy - lines_[-1][0]) < 0.45 * max(h, 1.0):
+                    lines_[-1][1].append(c)
+                else:
+                    lines_.append([cy, [c]])
+            seq = [c for _, l in lines_ for c in sorted(l, key=lambda c: c["bbox"][0])]
+            return " ".join(c["text"] for c in seq), " ".join(c["rich"] for c in seq)
+        lx = min((x for x, _ in delims), default=None)
+        rx = max((x for x, _ in delims), default=None)
+        left = [d for x, d in delims if x - lx < 3]
+        right = [d for x, d in delims if rx - x < 3]
+        if delims and rx - lx >= 3 and texts:
+            ob = next((_LEFT_PIECES[ch] for d in left for ch in d if ch in _LEFT_PIECES), "[")
+            cb = next((_RIGHT_PIECES[ch] for d in right for ch in d if ch in _RIGHT_PIECES), "]")
+            before = [c for c in texts if c["bbox"][0] < lx]
+            after = [c for c in texts if c["bbox"][0] >= rx]
+            inner = [c for c in texts if lx <= c["bbox"][0] < rx]
+            parts = []
+            for ps, wrap in ((before, False), (inner, True), (after, False)):
+                if ps:
+                    t, r = read(ps)
+                    parts.append(((ob + " " + t + " " + cb) if wrap else t, (ob + " " + r + " " + cb) if wrap else r))
+            text, rich = " ".join(p[0] for p in parts), " ".join(p[1] for p in parts)
+            notes.append("column %d: bracket glyphs read as '%s ... %s', stacked lines top-down" % (grp[0]["col"], ob, cb))
+        elif texts:
+            text, rich = read(texts)
+            if stacked:
+                notes.append("column %d: stacked lines read top-down" % grp[0]["col"])
+        else:
+            continue
+        bb = [min(c["bbox"][0] for c in grp), min(c["bbox"][1] for c in grp),
+              max(c["bbox"][2] for c in grp), max(c["bbox"][3] for c in grp)]
+        out.append(dict(grp[0], text=text, rich=rich, bbox=[round(v, 1) for v in bb]))
+    return out, ("; ".join(notes[:3]) + (" (+%d more)" % (len(notes) - 3) if len(notes) > 3 else "")) if notes else None
+
+
 def build_cells(tab, size, rules):
     rows = []
     for r in tab["rows_raw"]:
@@ -697,6 +786,7 @@ def build_cells(tab, size, rules):
     colspans = [(edges[k], edges[k + 1]) for k in range(ncol)]
     grid = []
     issues = []
+    stacked_rows = []
     for ri, r in enumerate(rows):
         line = []
         for c in r["cells"]:
@@ -707,6 +797,9 @@ def build_cells(tab, size, rules):
                 hit = [min(range(ncol), key=lambda k: abs((colspans[k][0] + colspans[k][1]) / 2.0 - cx))]
             line.append({"text": c["text"], "rich": c["rich"], "col": hit[0], "colspan": len(hit),
                          "bbox": [round(c["x0"], 1), round(c["y0"], 1), round(c["x1"], 1), round(c["y1"], 1)]})
+        line, fixed = _order_stacked(line)
+        if fixed:
+            stacked_rows.append((ri, fixed))
         # merge cells that landed in the same column (over-split)
         merged = []
         for c in line:
@@ -772,6 +865,11 @@ def build_cells(tab, size, rules):
             filled = sum(c["colspan"] for c in g["cells"]) + covered.get(ri, 0)
             if 0 < filled < ncol and len(g["cells"]) > 1 and ri > 0:
                 issues.append("row %d: %d of %d columns filled (empty cells or wrapped text)" % (ri, filled, ncol))
+    if stacked_rows:
+        kinds = sorted(set(k for _, n in stacked_rows for k in ("bracket glyphs read as [ ... ]", "stacked lines read top-down")
+                           if k.split()[0] in n))
+        repairs.append("%d row(s) (%s) with multi-line cells: %s" % (
+            len(stacked_rows), ", ".join(str(r) for r, _ in stacked_rows[:12]), "; ".join(kinds)))
     for i, g in enumerate(grid):
         g["header"] = i < hdr
     tab["ncols"] = ncol
