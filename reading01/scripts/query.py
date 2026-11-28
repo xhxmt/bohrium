@@ -10,6 +10,7 @@
   python3 query.py table 2 [--csv]             # one table (table-2 / 2 / "Table 2" / 表2) with locator
   python3 query.py tables | figures | equations | footnotes | furniture | refs [label]
   python3 query.py checks                      # QA checks and warnings
+  python3 query.py ocr 3 --bbox 60,330,300,560  # re-OCR a page region (PDF pt); [--dpi 300] [--lang eng] [--psm 6]
 Options: --doc NAME|PATH  pick one document (file name, stem or document.json path).
 Default: every document of the current run (/app/work/pdfdoc_state.json), else the newest document.json.
 Search patterns are regular expressions (case-insensitive); an invalid pattern, or --literal,
@@ -257,6 +258,8 @@ def run(cmd, a, d, path, multi):
                 break
             print("%s %s p%d: %s" % (r["id"], r["label"], r["page"], r["text"]))
             shown += 1
+    elif c == "ocr":
+        n = ocr_region(a, d)
     elif c == "checks":
         print("QA status: %s" % d["qa"]["status"])
         for k in d["qa"]["checks"]:
@@ -266,6 +269,59 @@ def run(cmd, a, d, path, multi):
     else:
         sys.exit("unknown command %s" % c)
     return n
+
+
+def ocr_region(a, d):
+    """Re-OCR one page or one region of it; prints lines with bbox in PDF pt (same frame as the parse).
+    Tesseract runs single-threaded with a time limit, so this never stalls the way a bare
+    `tesseract` call can inside a CPU-limited container."""
+    import tempfile
+    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+    from pdfdoc import backends as B
+    if not a.arg or not a.arg.isdigit():
+        sys.exit("ocr needs a page number: ocr 3 [--bbox x0,y0,x1,y1] [--dpi 300] [--lang eng] [--psm 6]")
+    pno = int(a.arg)
+    src = d["source"]["file"]
+    if not os.path.isfile(src):
+        sys.exit("source file %s not found" % src)
+    if a.bbox:
+        try:
+            bb = [float(v) for v in a.bbox.split(",")]
+            assert len(bb) == 4 and bb[2] > bb[0] and bb[3] > bb[1]
+        except Exception:
+            sys.exit("--bbox must be x0,y0,x1,y1 in PDF points (top-left origin), as printed by show/page")
+    else:
+        pg = next((p for p in d.get("pages", []) if p.get("page") == pno), None)
+        bb = [0.0, 0.0, float((pg or {}).get("width") or 612), float((pg or {}).get("height") or 792)]
+    dpi = max(72, min(int(a.dpi), 600))
+    lang = a.lang or (d.get("ocr") or {}).get("lang") or "eng"
+    if lang.startswith("per page"):
+        lang = "chi_sim+eng"
+    tmp = tempfile.mkdtemp(prefix="pdfdoc_ocr_")
+    png = os.path.join(tmp, "region.png")
+    if not B.render_clip_png(src, pno, bb, dpi, png, pad=0.0):
+        sys.exit("could not render page %d region %s" % (pno, bb))
+    pre, _notes = B._preprocess_for_ocr(png, os.path.join(tmp, "region_pre.png"))
+    scale = 72.0 / dpi
+    try:
+        from PIL import Image  # type: ignore
+        with Image.open(pre) as im1, Image.open(png) as im0:
+            scale *= float(im0.size[0]) / im1.size[0]
+    except Exception:
+        pass
+    try:
+        lines, mean, nwords, low = B.ocr_image_to_lines(pre, scale, lang, {}, psm=a.psm)
+    except Exception as e:
+        sys.exit("OCR failed: %s" % e)
+    print("p%d region %s dpi %d lang %s psm %d: %d words, mean conf %.1f (words < 60 marked ?)" % (
+        pno, [round(v, 1) for v in bb], dpi, lang, a.psm, nwords, mean))
+    for ln in lines:
+        ws = ln["words"]
+        x0, y0 = min(w["x0"] for w in ws) + bb[0], min(w["y0"] for w in ws) + bb[1]
+        x1, y1 = max(w["x1"] for w in ws) + bb[0], max(w["y1"] for w in ws) + bb[1]
+        txt = " ".join(w["t"] + ("?" if 0 <= w.get("conf", 100) < 60 else "") for w in ws)
+        print("[%.1f, %.1f, %.1f, %.1f] %s" % (x0, y0, x1, y1, txt))
+    return 1
 
 
 def main():
@@ -279,6 +335,10 @@ def main():
     ap.add_argument("--csv", action="store_true")
     ap.add_argument("--literal", "-F", action="store_true", help="search the pattern as plain text")
     ap.add_argument("--all", action="store_true", help="no output limit for section / refs")
+    ap.add_argument("--bbox", help="ocr: region x0,y0,x1,y1 in PDF points (default: whole page)")
+    ap.add_argument("--dpi", type=int, default=300, help="ocr: render resolution (default 300)")
+    ap.add_argument("--lang", help="ocr: tesseract language (default: the one the parse used)")
+    ap.add_argument("--psm", type=int, default=6, help="ocr: tesseract page segmentation mode (6 = one block)")
     a = ap.parse_args()
     paths = find_docs(a.doc)
     multi = len(paths) > 1

@@ -108,6 +108,19 @@ def main(argv=None):
     for n in notes:
         print("NOTE: " + n)
     print("=" * 78)
+    if mats:
+        # placeholder written before parsing: a slow OCR job or a crash must not leave the case
+        # without a contract-shaped result.json; the full draft below replaces it
+        try:
+            why = "parsing of %s not finished yet (placeholder written before parsing)" % (
+                ", ".join(os.path.basename(m) for m in mats))
+            early = C.build_result(case, case_path, cid, [], [], answers={"status": "partial", "status_reason": why},
+                                   task_txt=ttxt, contract=contract, fields=fields, missing_materials=missing,
+                                   urls=urls, draft=True, meta={}, soft_fields=soft)
+            with open(os.path.join(a.out, "result.json"), "w", encoding="utf-8") as fh:
+                json.dump(early, fh, ensure_ascii=False, indent=1)
+        except Exception as e:  # never block the real parse on the placeholder
+            print("NOTE: placeholder result.json not written: %r" % e)
     docs, failures = [], []
     for i, m in enumerate(mats):
         stem = os.path.splitext(os.path.basename(m))[0]

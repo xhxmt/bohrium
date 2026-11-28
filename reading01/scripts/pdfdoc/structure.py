@@ -444,7 +444,8 @@ def _row_headish(r, body):
         return False  # "¹University of ..." affiliation / footnote line
     if r.get("lead") and not NUMBERED_HEAD_RE.match(t) and not KNOWN_HEAD_RE.match(t):
         return False  # bold run-in lead followed by body text: a paragraph, not a heading
-    pseudo = {"text": t, "bold": r["bold"], "size": r["size"]}
+    pseudo = {"text": t, "bold": r["bold"], "size": r["size"],
+              "ocr": any(sg.get("conf") is not None for sg in r["segs"])}
     return _is_heading_seg(pseudo, body)
 
 
@@ -452,8 +453,12 @@ def _is_heading_seg(s, body):
     t = re.sub(r"\s+", " ", s["text"].strip())
     if len(t) > 160 or len(t) < 2:
         return False
-    if s["size"] < 0.95 * body:
-        return False  # headings are never set smaller than the body text
+    # headings are never set smaller than the body text. OCR sizes come from ink height, and a
+    # one-line heading without descenders ("1 Introduction", "3 BERT") reads ~15% small; OCR
+    # also has no bold flag, so a numbered title-case line may be up to 20% under body size.
+    ocr_num = bool(s.get("ocr")) and bool(NUMBERED_HEAD_RE.match(t)) and len(t.split()) <= 8
+    if s["size"] < (0.8 if ocr_num else 0.95) * body:
+        return False
     if re.search(r"\bet al\b|\d{3,}.*\d{3,}|\b(Phys|Rev|Lett|J\.|Proc)\.", t) and not s["bold"]:
         return False
     nw = len(t.split())

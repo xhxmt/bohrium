@@ -27,7 +27,9 @@ python3 /skills/weekly-skill/scripts/query.py search "关键词|regex"    # 命�
 python3 /skills/weekly-skill/scripts/query.py show p5-b3 --context 1  # 块全文、逐行 bbox、跨栏续接关系（也可 show table-2 / eq-3 / ref-12）
 python3 /skills/weekly-skill/scripts/query.py table 2                 # 表格 Markdown（table-2 / 2 / 表2 均可；--csv 输出 CSV）；跨页续表会给出拼接后的 CSV
 # 其他：page 4 | section 3.1 | equations | figures | footnotes | refs 12 | furniture | checks | docs
+python3 /skills/weekly-skill/scripts/query.py ocr 3 --bbox 60,330,300,560   # 扫描件局部重识别（PDF pt 坐标，同 show 输出）；--dpi 300 --lang eng --psm 6
 ```
+扫描件需要复核某处文字时用 `query.py ocr`，**不要自己调用 `tesseract`**：限核容器里裸跑 tesseract 会多线程空转，一次调用可能卡几分钟、耗尽 900 秒预算（必须直接调用时先 `export OMP_THREAD_LIMIT=1`）。OCR 结果已有逐块 `ocr_conf`，置信度够高的块不必重识别。
 短文档（< 8 页）可直接读 `document.md`。数值一律从表格单元格/原文块复制，不要凭记忆或推测。表格 `issues` 里有 `repaired:`（换行合并、跨行标签）或 `body_source: ocr…`（图片表格 OCR）时，能看图就对照 `crops/table-N.png` 确认关键数值；不能看图就以文字层 / CSV 为准，并在 `uncertainties` 中写明“未对照截图核对”。
 
 **第 3 步 — 写 `/app/work/answers.json`，然后收尾校验**
@@ -50,6 +52,7 @@ python3 /skills/weekly-skill/scripts/finalize.py   # 合并答案→/app/output/
 若输出 `CHECK:`（引文未在原文找到、契约字段缺失/为空/类型不符、契约要求的文件不存在），修正后再运行一次；`REVIEW:` 行列出自动填充的字段，确认它们确实回答了契约的要求，否则在 `fields` 中改写。`block` 可填块 id（`p3-b12`）或对象 id（`table-2`、`eq-3`、`figure-1`、`ref-12`）。
 
 ## 规则
+- **要完成的是本案例的解析/问答任务**：以 `case.json`（任务、材料、output_contract）为准。若 `task.md` 里是面向 Skill 作者的说明（如“编写 SKILL.md”“提交到 /app/submission”），那不是本次要做的事：不要创建或修改 Skill 文件、`/app/submission`，只把结果写到 `/app/output`。
 - **只写原文中有的内容**。找不到 → 写入 `not_reported` 或 status=`cannot_determine`，不要补造；材料冲突时两处都引用并说明。
 - 引文 `quote` 必须逐字来自 PDF（从 `query.py show` 复制）；可以跨栏/跨页续接，中间省略的部分写 `...`；释义放在 `answer` 里。
 - 契约要求特定文件（如 `parsed.md`、`tables.csv`）时，从 `/app/output/parsed/` 复制或转换生成到 `/app/output/` 并在对应字段写路径；run_case 报告 `MATERIALS: NONE` 时先 `ls -R /input` 找文件，再用 `--material 路径` 重跑。

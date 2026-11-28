@@ -736,7 +736,12 @@ def _preprocess_for_ocr(png_in, png_out):
 
 def _tesseract_tsv(img, lang, psm=3, timeout=120):  # noqa: D401
     cmd = ["tesseract", img, "stdout", "-l", lang, "--psm", str(psm), "tsv"]
-    res = subprocess.run(cmd, capture_output=True, timeout=timeout)
+    # Tesseract's OpenMP pool sizes itself to the host's cores; under a container CPU quota
+    # (or several jobs at once) the threads spin against the throttle and one page can take
+    # minutes instead of seconds. One thread per call is faster in every setting we measured.
+    env = dict(os.environ)
+    env.setdefault("OMP_THREAD_LIMIT", "1")
+    res = subprocess.run(cmd, capture_output=True, timeout=timeout, env=env)
     if res.returncode != 0:
         raise RuntimeError(res.stderr.decode("utf-8", "replace")[:300])
     return res.stdout.decode("utf-8", "replace")
