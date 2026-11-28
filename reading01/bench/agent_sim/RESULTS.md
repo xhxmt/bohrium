@@ -6,7 +6,7 @@
 
 | 文件 | 作用 |
 |---|---|
-| `Dockerfile` | 近似评测镜像：python 3.11、poppler-utils、tesseract（eng、chi_sim）、PyMuPDF、pdfplumber、Pillow、numpy、pandas |
+| `Dockerfile.txt`（构建时用 `docker build -f Dockerfile.txt .`） | 近似评测镜像：python 3.11、poppler-utils、tesseract（eng、chi_sim）、PyMuPDF、pdfplumber、Pillow、numpy、pandas |
 | `make_cases.py` | 从公开 arXiv 论文生成 3 个模拟案例（`/input/case.json` + `task.md` + PDF）；C 案例把 BERT 前 3 页渲染成无文字层的扫描件 |
 | `harness.py` | Agent 循环：OpenAI 兼容的 DeepSeek 接口，工具 bash / read_file / write_file，预算 64 次请求 / 900 秒 / 每次回复 16384 token；`--condition skill` 时把 Skill 只读挂载到 `/skills/weekly-skill` 并在系统提示中列出 Skill，`base` 时不挂载；记录 trace.jsonl 与 summary.json |
 | `check.py` | 作者自写的标准答案，逐项核对每次运行的 result.json，并汇总每个（案例, 条件）的平均值 |
